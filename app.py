@@ -344,7 +344,7 @@ if uploaded:
         for sname in xls.sheet_names:
             df = pd.read_excel(xls, sheet_name=sname, header=None, dtype=str)
             raw[sname] = df.fillna("")
-        if raw != st.session_state.raw_sheets:
+        if set(raw.keys()) != set(st.session_state.raw_sheets.keys()):
             st.session_state.raw_sheets     = raw
             st.session_state.selected_sheet = None
             st.session_state.rule_confirmed  = False

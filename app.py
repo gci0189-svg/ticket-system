@@ -508,24 +508,13 @@ if st.session_state.rule_confirmed:
                 f'</div>',
                 unsafe_allow_html=True
             )
-            st.text_area(
-                label=session_display,
-                value=label_text,
-                height=min(400, max(100, sess_people * 33)),
-                key=f"ta_{session_display}",
-                label_visibility="collapsed"
-            )
+            st.code(label_text, language=None)
 
         # 全部合併
         st.markdown("---")
         st.markdown("#### 📄 全部場次合併（如需一次複製全部）")
         all_text = "\n".join(t["label"] for t in tickets)
-        st.text_area(
-            "全部",
-            value=all_text,
-            height=min(500, max(150, len(tickets) * 33)),
-            label_visibility="collapsed"
-        )
+        st.code(all_text, language=None)
 
         # 標記已列印
         st.markdown("---")

@@ -143,13 +143,21 @@ def save_history(sid: str, keys: list, labels: list) -> bool:
 # ══════════════════════════════════════════════════════════
 
 def parse_session(raw: str):
-    """解析日期場次字串，回傳 (排序key, 顯示文字)"""
+    """解析日期場次字串，回傳 (排序key, 顯示文字)
+    支援格式：
+      2026/05/24(日)14:30、5/24 下午、2026-05-24 10:30
+    """
     if not raw:
         return (99, 99, 99), ""
     raw = str(raw)
-    m = re.search(r'(\d{1,2})[/／\-月](\d{1,2})', raw)
-    month = int(m.group(1)) if m else 99
-    day   = int(m.group(2)) if m else 99
+    # 優先嘗試 年/月/日 格式（避免誤把年份當月份）
+    m = re.search(r'\d{4}[/\-](\d{1,2})[/\-](\d{1,2})', raw)
+    if m:
+        month, day = int(m.group(1)), int(m.group(2))
+    else:
+        m = re.search(r'(\d{1,2})[/／\-月](\d{1,2})', raw)
+        month = int(m.group(1)) if m else 99
+        day   = int(m.group(2)) if m else 99
     if any(x in raw for x in ["14:30","15:00","下午","PM","pm"]):
         sess_str, sess_ord = "下午", 1
     elif any(x in raw for x in ["10:30","10:00","上午","AM","am"]):

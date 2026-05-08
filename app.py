@@ -76,6 +76,8 @@ html, body, [class*="css"] { font-family: 'Noto Sans TC', sans-serif; }
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
           "https://www.googleapis.com/auth/drive.readonly"]
 
+HISTORY_SHEET_ID = "1McLgRi-4haGs1orOXlCaucL6lM9E9uFgt4El8R4ZdkA"
+
 @st.cache_resource(ttl=300)
 def get_gc():
     try:
@@ -284,7 +286,7 @@ def group_by_session(tickets: list) -> dict:
 # Session State
 # ══════════════════════════════════════════════════════════
 defaults = {
-    "history_sid":    "",
+    "history_sid":    HISTORY_SHEET_ID,
     "history_set":    set(),
     "raw_sheets":     {},
     "selected_sheet": None,
@@ -310,24 +312,15 @@ st.markdown("""
 
 # ── 側邊欄 ────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("### ⚙️ 歷史紀錄設定")
-    sid_input = st.text_input(
-        "Google Sheets ID",
-        value=st.session_state.history_sid,
-        placeholder="貼上試算表 ID",
-        help="記錄已列印資料，防止重複列印"
-    )
-    if sid_input != st.session_state.history_sid:
-        st.session_state.history_sid = sid_input
-        st.session_state.history_set = set()
+    st.markdown("### ⚙️ 歷史紀錄")
+    if not st.session_state.history_set:
+        with st.spinner("載入歷史紀錄..."):
+            st.session_state.history_set = load_history(HISTORY_SHEET_ID)
 
-    if sid_input:
-        if st.button("🔄 重新載入歷史", use_container_width=True):
-            with st.spinner("連線中..."):
-                st.session_state.history_set = load_history(sid_input)
-            st.success(f"已載入 {len(st.session_state.history_set)} 筆")
-        elif not st.session_state.history_set:
-            st.session_state.history_set = load_history(sid_input)
+    if st.button("🔄 重新載入歷史", use_container_width=True):
+        with st.spinner("連線中..."):
+            st.session_state.history_set = load_history(HISTORY_SHEET_ID)
+        st.success(f"已載入 {len(st.session_state.history_set)} 筆")
 
     st.divider()
     st.markdown(f"📦 歷史紀錄：**{len(st.session_state.history_set)}** 筆")
@@ -523,13 +516,13 @@ if st.session_state.rule_confirmed:
         with col_p1:
             st.info(f"點「標記為已列印」後，這 **{len(tickets)}** 筆會寫入 Google Sheets，下次不再重複出現。")
         with col_p2:
-            if not st.session_state.history_sid:
+            if not HISTORY_SHEET_ID:
                 st.warning("請先在左側設定 Google Sheets ID")
             else:
                 if st.button("✅ 標記為已列印", type="primary", use_container_width=True):
                     keys   = [t["key"]   for t in tickets]
                     labels = [t["label"] for t in tickets]
-                    if save_history(st.session_state.history_sid, keys, labels):
+                    if save_history(HISTORY_SHEET_ID, keys, labels):
                         st.session_state.history_set.update(keys)
                         st.session_state.tickets        = []
                         st.session_state.skipped        = []

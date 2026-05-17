@@ -327,9 +327,23 @@ with st.sidebar:
     st.markdown(f"📦 歷史紀錄：**{len(st.session_state.history_set)}** 筆")
     st.divider()
     if st.button("🔄 重新開始", use_container_width=True):
-        for k in ["raw_sheets","selected_sheet","rule_confirmed","tickets","skipped","warnings"]:
+        for k in ["raw_sheets","selected_sheet","rule_confirmed","tickets","skipped","warnings","checked_keys"]:
             st.session_state[k] = defaults[k]
         st.rerun()
+
+    st.divider()
+    st.markdown("### 🖨️ 補印")
+    st.caption("輸入編號重新產生標籤（不受歷史紀錄限制）")
+    reprint_id = st.text_input("編號", placeholder="例如：4 或 4,7,12", key="reprint_input")
+    if st.button("產生補印標籤", use_container_width=True) and reprint_id:
+        tickets_now = st.session_state.get("tickets", []) + st.session_state.get("skipped", [])
+        ids = [x.strip() for x in reprint_id.replace("，",",").split(",") if x.strip()]
+        found = [t for t in tickets_now if t["id"] in ids]
+        if found:
+            labels = "\n".join(t["label"] for t in found)
+            st.code(labels, language=None)
+        else:
+            st.warning(f"找不到編號：{', '.join(ids)}\n（請先完成 STEP 2-3 載入資料）")
 
 
 # ══════════════════════════════════════════════════════════
@@ -496,55 +510,55 @@ if st.session_state.rule_confirmed:
             sess_checked = sum(1 for t in sess_tickets if t["key"] in st.session_state.checked_keys)
             all_checked  = sess_checked == sess_people
             safe_key     = session_display.replace("/","_").replace(" ","_")
+            unprinted    = [t for t in sess_tickets if t["key"] not in st.session_state.checked_keys]
 
-            # 場次標題 + 全選按鈕
-            hcol1, hcol2 = st.columns([6, 2])
-            with hcol1:
-                st.markdown(
-                    f'<div class="session-header" style="border-radius:8px;margin-top:1rem;">'                    f'<span>🗓 {session_display}</span>'                    f'<span>{sess_people} 人 ／ {sess_total} 張｜已勾 {sess_checked}</span>'                    f'</div>',
-                    unsafe_allow_html=True
-                )
-            with hcol2:
-                st.markdown("<br>", unsafe_allow_html=True)
-                btn_label = "☐ 取消全選" if all_checked else "✅ 全選此場次"
-                if st.button(btn_label, key=f"sel_{safe_key}", use_container_width=True):
-                    if not all_checked:
-                        for t in sess_tickets:
-                            st.session_state.checked_keys.add(t["key"])
-                    else:
-                        for t in sess_tickets:
-                            st.session_state.checked_keys.discard(t["key"])
-                    st.rerun()
+            exp_label = (f"🗓 {session_display}　"
+                         f"{sess_people} 人 ／ {sess_total} 張　"
+                         f"{'✅ 全勾' if all_checked else f'已勾 {sess_checked}/{sess_people}'}")
 
-            # 每一筆勾選列（用按鈕模擬 checkbox，避免 Streamlit rerun 狀態不同步）
-            for t in sess_tickets:
-                is_checked = t["key"] in st.session_state.checked_keys
-                col_chk, col_label = st.columns([1, 14])
-                with col_chk:
-                    icon = "✅" if is_checked else "⬜"
-                    if st.button(icon, key=f"chk_{t['key']}", use_container_width=True):
-                        if is_checked:
-                            st.session_state.checked_keys.discard(t["key"])
+            with st.expander(exp_label, expanded=False):
+                # 全選按鈕 + 複製按鈕
+                bcol1, bcol2 = st.columns([1, 1])
+                with bcol1:
+                    btn_label = "☐ 取消全選" if all_checked else "✅ 全選此場次"
+                    if st.button(btn_label, key=f"sel_{safe_key}", use_container_width=True):
+                        if not all_checked:
+                            for t in sess_tickets:
+                                st.session_state.checked_keys.add(t["key"])
                         else:
-                            st.session_state.checked_keys.add(t["key"])
+                            for t in sess_tickets:
+                                st.session_state.checked_keys.discard(t["key"])
                         st.rerun()
-                with col_label:
-                    if is_checked:
-                        st.markdown(
-                            f'<p style="color:#bbb;font-size:0.88rem;font-family:monospace;margin:6px 0;">'                            f'<s>{t["label"]}</s></p>',
-                            unsafe_allow_html=True
-                        )
-                    else:
-                        st.markdown(
-                            f'<p style="font-size:0.88rem;font-family:monospace;margin:6px 0;">{t["label"]}</p>',
-                            unsafe_allow_html=True
-                        )
+                with bcol2:
+                    if unprinted:
+                        with st.popover(f"📋 複製未列印（{len(unprinted)} 筆）", use_container_width=True):
+                            st.code("\n".join(t["label"] for t in unprinted), language=None)
 
-            # 此場次未勾選的複製區
-            unprinted = [t for t in sess_tickets if t["key"] not in st.session_state.checked_keys]
-            if unprinted:
-                with st.expander(f"📋 複製「{session_display}」未列印標籤（{len(unprinted)} 筆）"):
-                    st.code("\n".join(t["label"] for t in unprinted), language=None)
+                st.divider()
+
+                # 每一筆勾選列
+                for t in sess_tickets:
+                    is_checked = t["key"] in st.session_state.checked_keys
+                    col_chk, col_label = st.columns([1, 14])
+                    with col_chk:
+                        icon = "✅" if is_checked else "⬜"
+                        if st.button(icon, key=f"chk_{t['key']}", use_container_width=True):
+                            if is_checked:
+                                st.session_state.checked_keys.discard(t["key"])
+                            else:
+                                st.session_state.checked_keys.add(t["key"])
+                            st.rerun()
+                    with col_label:
+                        if is_checked:
+                            st.markdown(
+                                f'<p style="color:#bbb;font-size:0.88rem;font-family:monospace;margin:4px 0;">'                                f'<s>{t["label"]}</s></p>',
+                                unsafe_allow_html=True
+                            )
+                        else:
+                            st.markdown(
+                                f'<p style="font-size:0.88rem;font-family:monospace;margin:4px 0;">{t["label"]}</p>',
+                                unsafe_allow_html=True
+                            )
 
         # 全部未勾選複製區
         st.markdown("---")
@@ -572,7 +586,7 @@ if st.session_state.rule_confirmed:
                     labels = [t["label"] for t in to_archive]
                     if save_history(HISTORY_SHEET_ID, keys, labels):
                         st.session_state.history_set.update(keys)
-                        st.session_state.tickets      = [t for t in tickets if t["key"] not in checked]
+                        st.session_state.tickets      = [t for t in tickets if t["key"] not in st.session_state.checked_keys]
                         st.session_state.checked_keys = set()
                         st.success(f"✅ 已歸檔 {len(keys)} 筆！")
                         st.rerun()

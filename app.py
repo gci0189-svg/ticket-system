@@ -519,18 +519,23 @@ if st.session_state.rule_confirmed:
 
             # 每一筆勾選列
             for t in sess_tickets:
-                is_checked = t["key"] in checked
+                is_checked = t["key"] in st.session_state.checked_keys
                 col_chk, col_label = st.columns([1, 14])
                 with col_chk:
-                    cb = st.checkbox("", value=is_checked,
-                                     key=f"chk_{t['key']}",
-                                     label_visibility="collapsed")
-                    if cb != is_checked:
-                        if cb:
-                            st.session_state.checked_keys.add(t["key"])
-                        else:
-                            st.session_state.checked_keys.discard(t["key"])
-                        st.rerun()
+                    def make_toggle(key):
+                        def toggle():
+                            if st.session_state[f"chk_{key}"]:
+                                st.session_state.checked_keys.add(key)
+                            else:
+                                st.session_state.checked_keys.discard(key)
+                        return toggle
+                    st.checkbox(
+                        "",
+                        value=is_checked,
+                        key=f"chk_{t['key']}",
+                        on_change=make_toggle(t["key"]),
+                        label_visibility="collapsed"
+                    )
                 with col_label:
                     if is_checked:
                         st.markdown(

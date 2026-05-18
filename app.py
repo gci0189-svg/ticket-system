@@ -432,6 +432,9 @@ def parse_member_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
                 "key":              key,
                 "id":               last_id,
                 "name":             name or "(未填姓名)",
+                "sns":              str(row[2]).strip() if len(row) > 2 and row[2] else "",
+                "tel":              str(row[4]).strip() if len(row) > 4 and row[4] else "",
+                "seats":            [],
                 "sheet":            sheet_name,
                 "total_count":      0,
                 "earliest_sort":    sort_key,
@@ -447,6 +450,13 @@ def parse_member_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
             if (not merged[key]["name"] or merged[key]["name"] == "(未填姓名)") and name:
                 merged[key]["name"] = name
 
+        # 收集座位（同格內換行也分開）
+        raw_seat = str(row[7]).strip() if len(row) > 7 and row[7] else ""
+        if raw_seat:
+            import re as _re
+            for s in _re.split(r"[\n\r]+", raw_seat):
+                s = s.strip()
+                if s: merged[key]["seats"].append(s)
         merged[key]["total_count"] += count
 
     # 產生標籤
@@ -455,7 +465,9 @@ def parse_member_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
     for key, info in merged.items():
         label = (f"NO.{info['id']} {info['earliest_display']} "
                  f"貴賓｜{info['name']} X {info['total_count']}")
-        entry = {**info, "label": label, "count": info["total_count"]}
+        entry = {**info, "label": label, "count": info["total_count"],
+                  "sns": info.get("sns",""), "tel": info.get("tel",""),
+                  "seats": info.get("seats",[])}
         if info["is_new"]:
             tickets.append(entry)
         else:
@@ -792,42 +804,96 @@ if st.session_state.rule_confirmed:
 # ══════════════════════════════════════════════════════════
 if st.session_state.rule_confirmed and st.session_state.selected_sheet:
     st.markdown('<div class="step-box">', unsafe_allow_html=True)
-    st.markdown('<div class="step-title">STEP 5 ｜ 產生簽到表（下載 Excel 印出來給客人簽名）</div>', unsafe_allow_html=True)
+    st.markdown('<div class="step-title">STEP 5 ｜ 產生簽到表（預覽 ＋ 下載 Excel）</div>', unsafe_allow_html=True)
 
     sname = st.session_state.selected_sheet
     row0_str = " ".join(str(c) for c in st.session_state.raw_sheets[sname].iloc[0].tolist())
     is_member = ("姓名" in row0_str and "張數" in row0_str and "座位" in row0_str)
 
     if is_member:
-        show_name_input = st.text_input(
-            "演出名稱（顯示在簽到表標題）",
-            value="親子音樂劇《阿甯咕的爸鼻不見了？》",
-            key="show_name_input"
-        )
-        col_s1, col_s2 = st.columns([3, 1])
-        with col_s1:
-            st.info(f"將依工作表「{sname}」產生簽到表，每個場次一個分頁，可直接下載印出。")
-        with col_s2:
-            if st.button("📥 產生並下載簽到表", type="primary", use_container_width=True):
-                if st.session_state.get("uploaded_file_bytes"):
-                    with st.spinner("產生中..."):
-                        try:
-                            excel_bytes = generate_signin_excel(
-                                st.session_state.uploaded_file_bytes,
-                                sname,
-                                show_name_input
-                            )
-                            st.download_button(
-                                label="⬇️ 點此下載 Excel",
-                                data=excel_bytes,
-                                file_name=f"簽到表_{sname}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                use_container_width=True
-                            )
-                        except Exception as e:
-                            st.error(f"產生失敗：{e}")
-                else:
-                    st.warning("請重新上傳 xlsx 檔案")
+        # 演出名稱輸入 + 下載按鈕
+        col_name, col_btn = st.columns([4, 1])
+        with col_name:
+            show_name_input = st.text_input(
+                "演出名稱（顯示在簽到表標題）",
+                value="親子音樂劇《阿甯咕的爸鼻不見了？》",
+                key="show_name_input"
+            )
+        with col_btn:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.session_state.get("uploaded_file_bytes"):
+                excel_bytes = generate_signin_excel(
+                    st.session_state.uploaded_file_bytes,
+                    sname,
+                    show_name_input
+                )
+                st.download_button(
+                    label="📥 下載 Excel",
+                    data=excel_bytes,
+                    file_name=f"簽到表_{sname}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    type="primary"
+                )
+            else:
+                st.warning("請重新上傳 xlsx")
+
+        st.markdown("---")
+
+        # ── 網頁預覽：從已解析的 tickets+skipped 組合資料 ──
+        all_tickets = st.session_state.tickets + st.session_state.skipped
+
+        if all_tickets:
+            # 重新依場次分組（含已列印的）
+            preview_sessions = defaultdict(list)
+            for t in sorted(all_tickets, key=lambda x: (x["earliest_sort"], int(x["id"]))):
+                preview_sessions[t["earliest_display"]].append(t)
+
+            st.markdown("#### 👁 簽到表預覽（所有場次）")
+            st.caption("以下為網頁預覽版，實際 Excel 格式以下載為準")
+
+            for session_display, sess_tickets in sorted(preview_sessions.items(), key=lambda x: x[1][0]["earliest_sort"]):
+                sess_total = sum(t["count"] for t in sess_tickets)
+                with st.expander(f"🗓 {session_display}　{len(sess_tickets)} 人 ／ {sess_total} 張", expanded=True):
+                    # 表頭
+                    st.markdown(
+                        f'<div style="background:#1a1a2e;color:#e94560;font-weight:700;'
+                        f'padding:0.4rem 0.75rem;border-radius:6px 6px 0 0;font-size:0.85rem;">'
+                        f'{session_display}　{show_name_input}</div>',
+                        unsafe_allow_html=True
+                    )
+                    # 表格資料
+                    preview_data = []
+                    for t in sess_tickets:
+                        preview_data.append({
+                            "編號":     t["id"],
+                            "社群帳號": t.get("sns", ""),
+                            "姓名":     t["name"],
+                            "電話":     t.get("tel", ""),
+                            "座位":     "　".join(t.get("seats", [])),
+                            "張數":     t["count"],
+                            "領取簽名": ""
+                        })
+                    df_preview = pd.DataFrame(preview_data)
+                    st.dataframe(
+                        df_preview,
+                        use_container_width=True,
+                        hide_index=True,
+                        height=min(600, max(150, len(sess_tickets) * 36 + 40)),
+                        column_config={
+                            "編號":     st.column_config.TextColumn("編號",     width="small"),
+                            "社群帳號": st.column_config.TextColumn("社群帳號", width="medium"),
+                            "姓名":     st.column_config.TextColumn("姓名",     width="small"),
+                            "電話":     st.column_config.TextColumn("電話",     width="medium"),
+                            "座位":     st.column_config.TextColumn("座位",     width="large"),
+                            "張數":     st.column_config.NumberColumn("張數",   width="small"),
+                            "領取簽名": st.column_config.TextColumn("領取簽名", width="medium"),
+                        }
+                    )
+                    st.caption(f"合計：{len(sess_tickets)} 人 ／ {sess_total} 張")
+        else:
+            st.info("請先完成 STEP 3 解析資料，才能預覽簽到表。")
+
     else:
         st.info("此工作表格式尚未支援產生簽到表，請聯絡管理員更新程式。")
 

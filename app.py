@@ -428,11 +428,14 @@ def parse_member_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
         sort_key, display = parse_session(date_raw)
 
         if key not in merged:
+            # C欄（社群帳號）若含「樓」「排」表示誤填了座位資訊，視為空白
+            raw_sns = str(row[2]).strip() if len(row) > 2 and row[2] else ""
+            sns_val = "" if any(x in raw_sns for x in ["樓", "排"]) else raw_sns
             merged[key] = {
                 "key":              key,
                 "id":               last_id,
                 "name":             name or "(未填姓名)",
-                "sns":              str(row[2]).strip() if len(row) > 2 and row[2] else "",
+                "sns":              sns_val,
                 "tel":              str(row[4]).strip() if len(row) > 4 and row[4] else "",
                 "seats":            [],
                 "sheet":            sheet_name,

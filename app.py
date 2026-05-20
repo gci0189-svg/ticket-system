@@ -362,6 +362,99 @@ def parse_session(raw: str):
     return (month, day, sess_ord), display
 
 
+
+# ══════════════════════════════════════════════════════════
+# 解析函數：貴賓印製標籤版 ＆ 社福印製標籤版
+#
+# 欄位對應（已確認）：
+#   Row0 = 劇名（略過）
+#   Row1 = 標題列：編號、日期、姓名、座位（貴賓）/張數（社福）、張數
+#   Row2 起 = 資料
+#   A欄(0) = 編號
+#   B欄(1) = 日期場次
+#   C欄(2) = 姓名（已含「貴賓｜單位｜姓名」格式，直接使用）
+#   D欄(3) = 座位（貴賓）或 張數（社福）
+#   E欄(4) = 張數（貴賓）/ 無（社福）
+#
+# 標籤格式：{場次} {姓名欄原樣} X {張數}
+# 唯一識別碼：{編號}_{工作表名稱}
+# ══════════════════════════════════════════════════════════
+
+def parse_label_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
+    """
+    解析貴賓印製標籤版 / 社福印製標籤版。
+    Row0=劇名, Row1=標題, Row2起=資料
+    """
+    rows = df.values.tolist()
+    results  = []
+    warnings = []
+
+    # 判斷是貴賓（有座位欄）還是社福（無座位欄）
+    row1_str = " ".join(str(c) for c in rows[1]) if len(rows) > 1 else ""
+    has_seat_col = "座位" in row1_str
+    # 貴賓：A=編號 B=日期 C=姓名 D=座位 E=張數
+    # 社福：A=編號 B=日期 C=姓名 D=張數
+    COL_ID    = 0
+    COL_DATE  = 1
+    COL_NAME  = 2
+    COL_COUNT = 4 if has_seat_col else 3
+
+    for i, row in enumerate(rows):
+        if i < 2: continue  # 跳過劇名列和標題列
+
+        def get(idx):
+            if idx >= len(row): return ""
+            v = row[idx]
+            if v is None: return ""
+            if isinstance(v, __import__('datetime').datetime): return v.strftime("%Y/%m/%d")
+            return str(v).strip()
+
+        row_id   = re.sub(r"[^0-9]", "", get(COL_ID))
+        name     = get(COL_NAME)
+        date_raw = get(COL_DATE)
+        count_raw = get(COL_COUNT)
+
+        if not row_id or not name or not count_raw:
+            continue
+
+        count_clean = re.sub(r"[^0-9]", "", count_raw)
+        if not count_clean: continue
+        count = int(count_clean)
+        if count <= 0: continue
+
+        sort_key, display = parse_session(date_raw)
+        key = f"{row_id}_{sheet_name}"
+        label = f"{display} {name} X {count}"
+
+        entry = {
+            "key":              key,
+            "id":               row_id,
+            "name":             name,
+            "sheet":            sheet_name,
+            "total_count":      count,
+            "count":            count,
+            "earliest_sort":    sort_key,
+            "earliest_display": display,
+            "label":            label,
+            "sns":              "",
+            "tel":              "",
+            "seats":            [],
+            "is_new":           key not in history_set,
+        }
+
+        if entry["is_new"]:
+            results.append(entry)
+        else:
+            entry_copy = dict(entry)
+            results.append(entry_copy)
+
+    # 分開 new / skipped
+    tickets = [r for r in results if r["is_new"]]
+    skipped = [r for r in results if not r["is_new"]]
+    tickets.sort(key=lambda x: (x["earliest_sort"], int(x["id"])))
+    skipped.sort(key=lambda x: (x["earliest_sort"], int(x["id"])))
+    return tickets, skipped, warnings
+
 def parse_member_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
     """
     解析 LINE 會員格式工作表。
@@ -628,7 +721,12 @@ if st.session_state.selected_sheet:
     st.markdown(f'<div class="step-title">STEP 3 ｜ 確認解析規則：{sname}</div>', unsafe_allow_html=True)
 
     row0_str = " ".join(str(c) for c in df.iloc[0].tolist()) if len(df) > 0 else ""
-    is_member = ("姓名" in row0_str and "張數" in row0_str and "座位" in row0_str)
+    row1_str = " ".join(str(c) for c in df.iloc[1].tolist()) if len(df) > 1 else ""
+
+    # 判斷格式
+    is_member  = ("姓名" in row0_str and "張數" in row0_str and "座位" in row0_str)
+    is_label_vip  = ("編號" in row1_str and "日期" in row1_str and "張數" in row1_str and "座位" in row1_str)
+    is_label_welfare = ("編號" in row1_str and "日期" in row1_str and "張數" in row1_str and "座位" not in row1_str and "姓名" not in row0_str)
 
     if is_member:
         st.markdown('<div class="ok-box">✅ 偵測到：<strong>LINE 會員格式</strong></div>', unsafe_allow_html=True)
@@ -664,6 +762,43 @@ if st.session_state.selected_sheet:
                 st.session_state.rule_confirmed = True
                 st.session_state.checked_keys   = set()
                 st.rerun()
+
+    elif is_label_vip or is_label_welfare:
+        fmt_name = "貴賓印製標籤版" if is_label_vip else "社福印製標籤版"
+        st.markdown(f'<div class="ok-box">✅ 偵測到：<strong>{fmt_name}</strong></div>', unsafe_allow_html=True)
+        col1, col2 = st.columns(2)
+        with col1:
+            for key, val in [
+                ("標題列位置", "第 1 行（Row 1）"),
+                ("資料從",     "第 3 行開始"),
+                ("列印條件",   "張數有值即列印"),
+                ("合併邏輯",   "不合併，每行各自一筆"),
+            ]:
+                st.markdown(f'<div class="rule-box"><div class="rule-key">{key}</div><div class="rule-val">{val}</div></div>', unsafe_allow_html=True)
+        with col2:
+            for key, val in [
+                ("唯一識別碼", "編號 ＋ 工作表名稱"),
+                ("標籤格式",   "{日期場次} {姓名欄原樣} X {張數}"),
+                ("排序方式",   "依日期場次排序"),
+                ("輸出分組",   "每個場次獨立一區，各自可複製"),
+            ]:
+                st.markdown(f'<div class="rule-box"><div class="rule-key">{key}</div><div class="rule-val">{val}</div></div>', unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        col_a, col_b = st.columns([3, 1])
+        with col_a:
+            st.info("⚠️ 請確認以上規則符合這份 xlsx 的格式，再按右側按鈕")
+        with col_b:
+            if st.button("✅ 確認，開始產生標籤", type="primary", use_container_width=True):
+                with st.spinner("解析中..."):
+                    t, s, w = parse_label_sheet(df, sname, st.session_state.history_set)
+                st.session_state.tickets        = t
+                st.session_state.skipped        = s
+                st.session_state.warnings       = w
+                st.session_state.rule_confirmed = True
+                st.session_state.checked_keys   = set()
+                st.rerun()
+
     else:
         st.markdown("""
         <div class="warn-box">

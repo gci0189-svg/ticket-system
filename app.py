@@ -871,63 +871,82 @@ if st.session_state.rule_confirmed:
     else:
         grouped = group_by_session(tickets)
 
-        st.markdown("#### 📋 待列印標籤（依場次分組）")
+        st.markdown("#### 📋 待列印標籤（場次 → 工作表分組）")
 
         for session_display, sess_tickets in grouped.items():
             sess_people  = len(sess_tickets)
             sess_total   = sum(t["count"] for t in sess_tickets)
             sess_checked = sum(1 for t in sess_tickets if t["key"] in st.session_state.checked_keys)
             all_checked  = sess_checked == sess_people
-            safe_key     = session_display.replace("/","_").replace(" ","_")
-            unprinted    = [t for t in sess_tickets if t["key"] not in st.session_state.checked_keys]
+            safe_sess    = session_display.replace("/","_").replace(" ","_")
 
             exp_label = (f"🗓 {session_display}　"
                          f"{sess_people} 人 ／ {sess_total} 張　"
                          f"{'✅ 全勾' if all_checked else f'已勾 {sess_checked}/{sess_people}'}")
 
             with st.expander(exp_label, expanded=False):
-                # 全選按鈕 + 複製按鈕
-                bcol1, bcol2 = st.columns([1, 1])
-                with bcol1:
-                    btn_label = "☐ 取消全選" if all_checked else "✅ 全選此場次"
-                    if st.button(btn_label, key=f"sel_{safe_key}", use_container_width=True):
-                        if not all_checked:
-                            for t in sess_tickets:
-                                st.session_state.checked_keys.add(t["key"])
-                        else:
-                            for t in sess_tickets:
-                                st.session_state.checked_keys.discard(t["key"])
-                        st.rerun()
-                with bcol2:
-                    if unprinted:
-                        with st.popover(f"📋 複製未列印（{len(unprinted)} 筆）", use_container_width=True):
-                            st.code("\n".join(t["label"] for t in unprinted), language=None)
 
-                st.divider()
-
-                # 每一筆勾選列
+                # ── 依工作表分子群組 ──
+                sheet_groups = {}
                 for t in sess_tickets:
-                    is_checked = t["key"] in st.session_state.checked_keys
-                    col_chk, col_label = st.columns([1, 14])
-                    with col_chk:
-                        icon = "✅" if is_checked else "⬜"
-                        if st.button(icon, key=f"chk_{t['key']}", use_container_width=True):
-                            if is_checked:
-                                st.session_state.checked_keys.discard(t["key"])
+                    sheet_groups.setdefault(t["sheet"], []).append(t)
+
+                for sheet_name, sheet_tickets in sheet_groups.items():
+                    sg_people  = len(sheet_tickets)
+                    sg_total   = sum(t["count"] for t in sheet_tickets)
+                    sg_checked = sum(1 for t in sheet_tickets if t["key"] in st.session_state.checked_keys)
+                    sg_all     = sg_checked == sg_people
+                    safe_sg    = f"{safe_sess}_{sheet_name.replace(' ','_').replace('/','_')}"
+                    sg_unprinted = [t for t in sheet_tickets if t["key"] not in st.session_state.checked_keys]
+
+                    # 子群組標題列
+                    st.markdown(
+                        f'<div style="background:#f0f0f0;padding:0.4rem 0.75rem;border-radius:6px;'                        f'margin:0.5rem 0 0.25rem;font-weight:700;font-size:0.85rem;">'                        f'📂 {sheet_name}　{sg_people} 人 ／ {sg_total} 張　已勾 {sg_checked}/{sg_people}</div>',
+                        unsafe_allow_html=True
+                    )
+
+                    # 子群組操作列：全選 + 複製
+                    gc1, gc2 = st.columns([1, 1])
+                    with gc1:
+                        sg_btn = "☐ 取消全選" if sg_all else "✅ 全選此群組"
+                        if st.button(sg_btn, key=f"sel_{safe_sg}", use_container_width=True):
+                            if not sg_all:
+                                for t in sheet_tickets:
+                                    st.session_state.checked_keys.add(t["key"])
                             else:
-                                st.session_state.checked_keys.add(t["key"])
+                                for t in sheet_tickets:
+                                    st.session_state.checked_keys.discard(t["key"])
                             st.rerun()
-                    with col_label:
-                        if is_checked:
-                            st.markdown(
-                                f'<p style="color:#bbb;font-size:0.88rem;font-family:monospace;margin:4px 0;">'                                f'<s>{t["label"]}</s></p>',
-                                unsafe_allow_html=True
-                            )
-                        else:
-                            st.markdown(
-                                f'<p style="font-size:0.88rem;font-family:monospace;margin:4px 0;">{t["label"]}</p>',
-                                unsafe_allow_html=True
-                            )
+                    with gc2:
+                        if sg_unprinted:
+                            with st.popover(f"📋 複製未列印（{len(sg_unprinted)} 筆）", use_container_width=True):
+                                st.code("\n".join(t["label"] for t in sg_unprinted), language=None)
+
+                    # 每一筆勾選列
+                    for t in sheet_tickets:
+                        is_checked = t["key"] in st.session_state.checked_keys
+                        col_chk, col_lbl = st.columns([1, 14])
+                        with col_chk:
+                            icon = "✅" if is_checked else "⬜"
+                            if st.button(icon, key=f"chk_{t['key']}", use_container_width=True):
+                                if is_checked:
+                                    st.session_state.checked_keys.discard(t["key"])
+                                else:
+                                    st.session_state.checked_keys.add(t["key"])
+                                st.rerun()
+                        with col_lbl:
+                            if is_checked:
+                                st.markdown(
+                                    f'<p style="color:#bbb;font-size:0.88rem;font-family:monospace;margin:4px 0;">'                                    f'<s>{t["label"]}</s></p>',
+                                    unsafe_allow_html=True
+                                )
+                            else:
+                                st.markdown(
+                                    f'<p style="font-size:0.88rem;font-family:monospace;margin:4px 0;">{t["label"]}</p>',
+                                    unsafe_allow_html=True
+                                )
+
+                    st.markdown("---")
 
         # 歸檔按鈕
         st.markdown("---")

@@ -589,7 +589,7 @@ defaults = {
     "history_sid":    HISTORY_SHEET_ID,
     "history_set":    set(),
     "raw_sheets":     {},
-    "selected_sheet": None,
+    "selected_sheets": [],   # 改為多選清單
     "rule_confirmed": False,
     "tickets":        [],
     "skipped":        [],
@@ -628,7 +628,7 @@ with st.sidebar:
     st.markdown(f"📦 歷史紀錄：**{len(st.session_state.history_set)}** 筆")
     st.divider()
     if st.button("🔄 重新開始", use_container_width=True):
-        for k in ["raw_sheets","selected_sheet","rule_confirmed","tickets","skipped","warnings","checked_keys"]:
+        for k in ["raw_sheets","selected_sheets","rule_confirmed","tickets","skipped","warnings","checked_keys"]:
             st.session_state[k] = defaults[k]
         st.rerun()
 
@@ -665,7 +665,7 @@ if uploaded:
             raw[sname] = df.fillna("")
         if set(raw.keys()) != set(st.session_state.raw_sheets.keys()):
             st.session_state.raw_sheets     = raw
-            st.session_state.selected_sheet = None
+            st.session_state.selected_sheets = []
             st.session_state.rule_confirmed  = False
             st.session_state.tickets         = []
             st.session_state.skipped         = []
@@ -678,34 +678,46 @@ st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════
-# STEP 2：預覽 + 選擇工作表
+# STEP 2：預覽 + 選擇工作表（多選）
 # ══════════════════════════════════════════════════════════
 if st.session_state.raw_sheets:
     st.markdown('<div class="step-box">', unsafe_allow_html=True)
-    st.markdown('<div class="step-title">STEP 2 ｜ 預覽工作表，選擇要處理的那一張</div>', unsafe_allow_html=True)
+    st.markdown('<div class="step-title">STEP 2 ｜ 預覽工作表，選擇要處理的工作表（可多選）</div>', unsafe_allow_html=True)
 
     sheet_names = list(st.session_state.raw_sheets.keys())
-    tabs = st.tabs(sheet_names)
-    for tab, sname in zip(tabs, sheet_names):
-        with tab:
-            preview = st.session_state.raw_sheets[sname].iloc[:8, :12]
-            st.dataframe(preview, use_container_width=True, height=230)
+
+    # 預覽：下拉選一張預覽
+    preview_sheet = st.selectbox(
+        "預覽工作表內容",
+        options=sheet_names,
+        key="preview_select"
+    )
+    preview = st.session_state.raw_sheets[preview_sheet].iloc[:8, :12]
+    st.dataframe(preview, use_container_width=True, height=220)
 
     st.markdown("<br>", unsafe_allow_html=True)
-    cur_idx = (sheet_names.index(st.session_state.selected_sheet) + 1
-               if st.session_state.selected_sheet in sheet_names else 0)
-    selected = st.selectbox(
-        "選擇要產生標籤的工作表",
-        options=["（請選擇）"] + sheet_names,
-        index=cur_idx
+
+    # 多選
+    selected_sheets = st.multiselect(
+        "選擇要產生標籤的工作表（可多選，將合併成一份）",
+        options=sheet_names,
+        default=st.session_state.selected_sheets or []
     )
-    if selected != "（請選擇）" and selected != st.session_state.selected_sheet:
-        st.session_state.selected_sheet = selected
-        st.session_state.rule_confirmed  = False
-        st.session_state.tickets         = []
-        st.session_state.skipped         = []
-        st.session_state.warnings        = []
-        st.rerun()
+
+    col_sel, col_btn = st.columns([4, 1])
+    with col_sel:
+        if selected_sheets:
+            st.caption(f"已選 {len(selected_sheets)} 張：{'、'.join(selected_sheets)}")
+    with col_btn:
+        if st.button("✅ 確認選擇", type="primary", use_container_width=True, disabled=not selected_sheets):
+            if selected_sheets != st.session_state.selected_sheets:
+                st.session_state.selected_sheets = selected_sheets
+                st.session_state.rule_confirmed   = False
+                st.session_state.tickets          = []
+                st.session_state.skipped          = []
+                st.session_state.warnings         = []
+                st.session_state.checked_keys     = set()
+            st.rerun()
 
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -713,12 +725,14 @@ if st.session_state.raw_sheets:
 # ══════════════════════════════════════════════════════════
 # STEP 3：確認解析規則
 # ══════════════════════════════════════════════════════════
-if st.session_state.selected_sheet:
-    sname = st.session_state.selected_sheet
+if st.session_state.selected_sheets:
+    # 取第一張表的格式來判斷（多選時要求格式一致）
+    sname = st.session_state.selected_sheets[0]
     df    = st.session_state.raw_sheets[sname]
+    snames_display = "、".join(st.session_state.selected_sheets)
 
     st.markdown('<div class="step-box">', unsafe_allow_html=True)
-    st.markdown(f'<div class="step-title">STEP 3 ｜ 確認解析規則：{sname}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="step-title">STEP 3 ｜ 確認解析規則：{snames_display}</div>', unsafe_allow_html=True)
 
     row0_str = " ".join(str(c) for c in df.iloc[0].tolist()) if len(df) > 0 else ""
     row1_str = " ".join(str(c) for c in df.iloc[1].tolist()) if len(df) > 1 else ""
@@ -755,10 +769,15 @@ if st.session_state.selected_sheet:
         with col_b:
             if st.button("✅ 確認，開始產生標籤", type="primary", use_container_width=True):
                 with st.spinner("解析中..."):
-                    t, s, w = parse_member_sheet(df, sname, st.session_state.history_set)
-                st.session_state.tickets        = t
-                st.session_state.skipped        = s
-                st.session_state.warnings       = w
+                    all_t, all_s, all_w = [], [], []
+                    for sh in st.session_state.selected_sheets:
+                        df_sh = st.session_state.raw_sheets[sh]
+                        t, s, w = parse_member_sheet(df_sh, sh, st.session_state.history_set)
+                        all_t.extend(t); all_s.extend(s); all_w.extend(w)
+                    all_t.sort(key=lambda x: (x["earliest_sort"], int(x["id"])))
+                st.session_state.tickets        = all_t
+                st.session_state.skipped        = all_s
+                st.session_state.warnings       = all_w
                 st.session_state.rule_confirmed = True
                 st.session_state.checked_keys   = set()
                 st.rerun()
@@ -791,10 +810,15 @@ if st.session_state.selected_sheet:
         with col_b:
             if st.button("✅ 確認，開始產生標籤", type="primary", use_container_width=True):
                 with st.spinner("解析中..."):
-                    t, s, w = parse_label_sheet(df, sname, st.session_state.history_set)
-                st.session_state.tickets        = t
-                st.session_state.skipped        = s
-                st.session_state.warnings       = w
+                    all_t, all_s, all_w = [], [], []
+                    for sh in st.session_state.selected_sheets:
+                        df_sh = st.session_state.raw_sheets[sh]
+                        t, s, w = parse_label_sheet(df_sh, sh, st.session_state.history_set)
+                        all_t.extend(t); all_s.extend(s); all_w.extend(w)
+                    all_t.sort(key=lambda x: (x["earliest_sort"], int(x["id"])))
+                st.session_state.tickets        = all_t
+                st.session_state.skipped        = all_s
+                st.session_state.warnings       = all_w
                 st.session_state.rule_confirmed = True
                 st.session_state.checked_keys   = set()
                 st.rerun()
@@ -940,11 +964,15 @@ if st.session_state.rule_confirmed:
 # ══════════════════════════════════════════════════════════
 # STEP 5：產生簽到表
 # ══════════════════════════════════════════════════════════
-if st.session_state.rule_confirmed and st.session_state.selected_sheet:
+if st.session_state.rule_confirmed and st.session_state.selected_sheets:
     st.markdown('<div class="step-box">', unsafe_allow_html=True)
     st.markdown('<div class="step-title">STEP 5 ｜ 產生簽到表（預覽 ＋ 下載 Excel）</div>', unsafe_allow_html=True)
 
-    sname = st.session_state.selected_sheet
+    sname = st.session_state.selected_sheets[0] if st.session_state.selected_sheets else None
+    if not sname:
+        st.warning("請先在 STEP 2 選擇工作表")
+        st.markdown('</div>', unsafe_allow_html=True)
+        st.stop()
     row0_str = " ".join(str(c) for c in st.session_state.raw_sheets[sname].iloc[0].tolist())
     is_member = ("姓名" in row0_str and "張數" in row0_str and "座位" in row0_str)
 

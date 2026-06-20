@@ -1004,7 +1004,8 @@ elif st.session_state.page == "labels":
                         sheet_groups.setdefault(t["sheet"], []).append(t)
 
                     for sheet_name, group_tickets in sheet_groups.items():
-                        safe_id = re.sub(r"[^0-9a-zA-Z]", "_", f"{session_display}_{sheet_name}")
+                        import hashlib
+                        safe_id = hashlib.md5(f"{session_display}_{sheet_name}".encode("utf-8")).hexdigest()[:12]
                         editor_key = f"editor_{safe_id}"
 
                         sg_total   = sum(st.session_state.edits.get(t["key"], {}).get("count", t["count"]) for t in group_tickets)

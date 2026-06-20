@@ -128,6 +128,33 @@ def save_history(sid: str, keys: list, labels: list) -> bool:
         st.error(f"儲存失敗：{e}")
         return False
 
+def remove_history(sid: str, keys_to_remove: list) -> bool:
+    """從已列印紀錄中移除指定 key（取消歸檔用）"""
+    gc = get_gc()
+    if not gc:
+        st.error("Google Sheets 連線失敗")
+        return False
+    try:
+        sh = gc.open_by_key(sid)
+        ws = sh.worksheet("已列印紀錄")
+        all_values = ws.get_all_values()
+        if not all_values:
+            return True
+        header = all_values[0]
+        keep_rows = [header]
+        removed = 0
+        for row in all_values[1:]:
+            if row and row[0] in keys_to_remove:
+                removed += 1
+                continue
+            keep_rows.append(row)
+        ws.clear()
+        ws.append_rows(keep_rows)
+        return True
+    except Exception as e:
+        st.error(f"取消歸檔失敗：{e}")
+        return False
+
 
 # ══════════════════════════════════════════════════════════
 # 解析函數：LINE 會員格式（5月親子｜會員購票）
@@ -174,6 +201,66 @@ def _get(row, idx):
     if v is None: return ""
     if isinstance(v, datetime): return v.strftime("%Y/%m/%d")
     return str(v).strip()
+
+
+# ══════════════════════════════════════════════════════════
+# 把網頁上的編輯寫回 xlsx
+# ══════════════════════════════════════════════════════════
+def apply_edits_to_xlsx(file_bytes: bytes, sheet_name: str, edits: dict, all_tickets: list) -> bytes:
+    """
+    把 edits 寫回原始 xlsx 的對應欄位。
+    只改 LINE 會員格式（姓名 D欄、張數 I欄、電話 E欄、座位 H欄）。
+    回傳修改後的 xlsx bytes。
+    """
+    from openpyxl import load_workbook
+    from io import BytesIO
+    import re
+
+    wb = load_workbook(BytesIO(file_bytes))
+    if sheet_name not in wb.sheetnames:
+        raise ValueError(f"找不到工作表：{sheet_name}")
+    ws = wb[sheet_name]
+
+    # 建立 編號 → row_number 對應（從 Row3 開始）
+    id_to_rows = {}
+    for row in ws.iter_rows(min_row=3):
+        cell_id = str(row[1].value or "").strip()
+        id_digits = re.sub(r"[^0-9]", "", cell_id)
+        if id_digits:
+            id_to_rows.setdefault(id_digits, []).append(row[0].row)
+
+    # 建立 key → ticket 對應
+    key_to_ticket = {t["key"]: t for t in all_tickets}
+
+    COL_NAME  = 4   # D（1-based）
+    COL_TEL   = 5   # E
+    COL_SEAT  = 8   # H
+    COL_COUNT = 9   # I
+
+    for key, ed in edits.items():
+        ticket = key_to_ticket.get(key)
+        if not ticket:
+            continue
+        row_id = ticket["id"]
+        row_nums = id_to_rows.get(row_id, [])
+        if not row_nums:
+            continue
+        # 只改第一行（主行）
+        first_row = min(row_nums)
+        if "name" in ed:
+            ws.cell(row=first_row, column=COL_NAME).value = ed["name"]
+        if "tel" in ed:
+            ws.cell(row=first_row, column=COL_TEL).value = ed["tel"]
+        if "seats" in ed:
+            ws.cell(row=first_row, column=COL_SEAT).value = ed["seats"]
+        if "count" in ed:
+            # 如果只有一行就直接改，多行的話只改第一行
+            ws.cell(row=first_row, column=COL_COUNT).value = ed["count"]
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
 
 def generate_signin_excel(file_bytes: bytes, sheet_name: str, show_name: str) -> bytes:
     """
@@ -586,16 +673,19 @@ def group_by_session(tickets: list) -> dict:
 # Session State
 # ══════════════════════════════════════════════════════════
 defaults = {
-    "history_sid":    HISTORY_SHEET_ID,
-    "history_set":    set(),
-    "raw_sheets":     {},
-    "selected_sheets": [],   # 改為多選清單
-    "rule_confirmed": False,
-    "tickets":        [],
-    "skipped":        [],
-    "warnings":       [],
-    "checked_keys":   set(),   # 使用者勾選「已列印」的 key 集合
+    "history_sid":         HISTORY_SHEET_ID,
+    "history_set":         set(),
+    "raw_sheets":          {},
+    "selected_sheets":     [],
+    "rule_confirmed":      False,
+    "tickets":             [],
+    "skipped":             [],
+    "warnings":            [],
+    "checked_keys":        set(),
     "uploaded_file_bytes": None,
+    "editing_key":         None,       # 目前正在編輯的票券 key
+    "expanded_sessions":   set(),      # 記住哪些場次是展開的
+    "edits":               {},         # {key: {name, count, tel, seats}} 使用者的修改
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -879,12 +969,19 @@ if st.session_state.rule_confirmed:
             sess_checked = sum(1 for t in sess_tickets if t["key"] in st.session_state.checked_keys)
             all_checked  = sess_checked == sess_people
             safe_sess    = session_display.replace("/","_").replace(" ","_")
+            is_expanded  = session_display in st.session_state.expanded_sessions
 
             exp_label = (f"🗓 {session_display}　"
                          f"{sess_people} 人 ／ {sess_total} 張　"
                          f"{'✅ 全勾' if all_checked else f'已勾 {sess_checked}/{sess_people}'}")
 
-            with st.expander(exp_label, expanded=False):
+            # expander 展開狀態由 session state 控制
+            expanded = st.expander(exp_label, expanded=is_expanded)
+
+            # 追蹤展開/收起（用 checkbox 模擬 toggle）
+            with expanded:
+                # 記住這個 session 是展開的
+                st.session_state.expanded_sessions.add(session_display)
 
                 # ── 依工作表分子群組 ──
                 sheet_groups = {}
@@ -893,19 +990,20 @@ if st.session_state.rule_confirmed:
 
                 for sheet_name, sheet_tickets in sheet_groups.items():
                     sg_people  = len(sheet_tickets)
-                    sg_total   = sum(t["count"] for t in sheet_tickets)
+                    # 套用編輯後的張數計算
+                    sg_total   = sum(st.session_state.edits.get(t["key"], {}).get("count", t["count"]) for t in sheet_tickets)
                     sg_checked = sum(1 for t in sheet_tickets if t["key"] in st.session_state.checked_keys)
                     sg_all     = sg_checked == sg_people
                     safe_sg    = f"{safe_sess}_{sheet_name.replace(' ','_').replace('/','_')}"
                     sg_unprinted = [t for t in sheet_tickets if t["key"] not in st.session_state.checked_keys]
 
-                    # 子群組標題列
+                    # 子群組標題
                     st.markdown(
-                        f'<div style="background:#f0f0f0;padding:0.4rem 0.75rem;border-radius:6px;'                        f'margin:0.5rem 0 0.25rem;font-weight:700;font-size:0.85rem;">'                        f'📂 {sheet_name}　{sg_people} 人 ／ {sg_total} 張　已勾 {sg_checked}/{sg_people}</div>',
+                        f'<div style="background:#f0f0f0;padding:0.4rem 0.75rem;border-radius:6px;'                        f'margin:0.75rem 0 0.25rem;font-weight:700;font-size:0.85rem;">'                        f'📂 {sheet_name}　{sg_people} 人 ／ {sg_total} 張　已勾 {sg_checked}/{sg_people}</div>',
                         unsafe_allow_html=True
                     )
 
-                    # 子群組操作列：全選 + 複製
+                    # 全選 + 複製
                     gc1, gc2 = st.columns([1, 1])
                     with gc1:
                         sg_btn = "☐ 取消全選" if sg_all else "✅ 全選此群組"
@@ -919,34 +1017,130 @@ if st.session_state.rule_confirmed:
                             st.rerun()
                     with gc2:
                         if sg_unprinted:
+                            # 複製時用編輯後的標籤
+                            def make_label(t):
+                                ed = st.session_state.edits.get(t["key"], {})
+                                name  = ed.get("name",  t["name"])
+                                count = ed.get("count", t["count"])
+                                parts = t["label"].split("貴賓｜")
+                                if len(parts) == 2:
+                                    return f"{parts[0]}貴賓｜{name} X {count}"
+                                return f"{t['earliest_display']} {name} X {count}"
+                            copy_text = "\n".join(make_label(t) for t in sg_unprinted)
                             with st.popover(f"📋 複製未列印（{len(sg_unprinted)} 筆）", use_container_width=True):
-                                st.code("\n".join(t["label"] for t in sg_unprinted), language=None)
+                                st.code(copy_text, language=None)
 
-                    # 每一筆勾選列
-                    for t in sheet_tickets:
-                        is_checked = t["key"] in st.session_state.checked_keys
-                        col_chk, col_lbl = st.columns([1, 14])
-                        with col_chk:
-                            icon = "✅" if is_checked else "⬜"
-                            if st.button(icon, key=f"chk_{t['key']}", use_container_width=True):
-                                if is_checked:
-                                    st.session_state.checked_keys.discard(t["key"])
-                                else:
+                    # 未勾選逐筆顯示；已勾選收合摘要
+                    unchecked_tickets = [t for t in sheet_tickets if t["key"] not in st.session_state.checked_keys]
+                    checked_tickets   = [t for t in sheet_tickets if t["key"] in st.session_state.checked_keys]
+
+                    for t in unchecked_tickets:
+                        is_editing  = st.session_state.editing_key == t["key"]
+                        ed          = st.session_state.edits.get(t["key"], {})
+                        disp_name   = ed.get("name",  t["name"])
+                        disp_count  = ed.get("count", t["count"])
+                        disp_tel    = ed.get("tel",   t.get("tel",""))
+                        disp_seats  = ed.get("seats", "　".join(t.get("seats",[])))
+
+                        parts = t["label"].split("貴賓｜")
+                        if len(parts) == 2:
+                            cur_label = f"{parts[0]}貴賓｜{disp_name} X {disp_count}"
+                        else:
+                            cur_label = f"{t['earliest_display']} {disp_name} X {disp_count}"
+                        has_edit = t["key"] in st.session_state.edits
+
+                        if is_editing:
+                            st.markdown('<div style="background:#fff9e6;border:1px solid #ffc107;border-radius:8px;padding:0.6rem 0.75rem;margin:4px 0;">', unsafe_allow_html=True)
+                            e1, e2 = st.columns([3, 1])
+                            with e1:
+                                new_name = st.text_input("姓名", value=disp_name, key=f"ei_name_{t['key']}")
+                            with e2:
+                                new_count = st.number_input("張數", value=int(disp_count), min_value=1, max_value=200, key=f"ei_count_{t['key']}")
+                            e3, e4 = st.columns([1, 1])
+                            with e3:
+                                new_tel = st.text_input("電話", value=disp_tel, key=f"ei_tel_{t['key']}")
+                            with e4:
+                                new_seats = st.text_input("座位", value=disp_seats, key=f"ei_seats_{t['key']}")
+                            s1, s2 = st.columns([1, 1])
+                            with s1:
+                                if st.button("💾 儲存", key=f"save_{t['key']}", use_container_width=True, type="primary"):
+                                    st.session_state.edits[t["key"]] = {
+                                        "name":  new_name,
+                                        "count": new_count,
+                                        "tel":   new_tel,
+                                        "seats": new_seats,
+                                    }
+                                    st.session_state.editing_key = None
+                                    st.rerun()
+                            with s2:
+                                if st.button("✖ 取消", key=f"cancel_{t['key']}", use_container_width=True):
+                                    st.session_state.editing_key = None
+                                    st.rerun()
+                            st.markdown('</div>', unsafe_allow_html=True)
+                        else:
+                            col_chk, col_edit, col_lbl = st.columns([1, 1, 14])
+                            with col_chk:
+                                if st.button("⬜", key=f"chk_{t['key']}", use_container_width=True):
                                     st.session_state.checked_keys.add(t["key"])
-                                st.rerun()
-                        with col_lbl:
-                            if is_checked:
+                                    st.rerun()
+                            with col_edit:
+                                edit_icon = "✏️✓" if has_edit else "✏️"
+                                if st.button(edit_icon, key=f"edit_{t['key']}", use_container_width=True):
+                                    st.session_state.editing_key = t["key"]
+                                    st.rerun()
+                            with col_lbl:
+                                color = "#e65c00" if has_edit else "inherit"
                                 st.markdown(
-                                    f'<p style="color:#bbb;font-size:0.88rem;font-family:monospace;margin:4px 0;">'                                    f'<s>{t["label"]}</s></p>',
+                                    f'<p style="color:{color};font-size:0.88rem;font-family:monospace;margin:4px 0;">'
+                                    f'{cur_label}</p>',
                                     unsafe_allow_html=True
                                 )
-                            else:
-                                st.markdown(
-                                    f'<p style="font-size:0.88rem;font-family:monospace;margin:4px 0;">{t["label"]}</p>',
-                                    unsafe_allow_html=True
-                                )
+
+                    if checked_tickets:
+                        with st.expander(f"✅ 已勾選 {len(checked_tickets)} 筆（點開可取消勾選）", expanded=False):
+                            for t in checked_tickets:
+                                ed = st.session_state.edits.get(t["key"], {})
+                                disp_name  = ed.get("name",  t["name"])
+                                disp_count = ed.get("count", t["count"])
+                                parts = t["label"].split("貴賓｜")
+                                if len(parts) == 2:
+                                    cur_label = f"{parts[0]}貴賓｜{disp_name} X {disp_count}"
+                                else:
+                                    cur_label = f"{t['earliest_display']} {disp_name} X {disp_count}"
+                                cc1, cc2 = st.columns([1, 14])
+                                with cc1:
+                                    if st.button("✅", key=f"uncheck_{t['key']}", use_container_width=True):
+                                        st.session_state.checked_keys.discard(t["key"])
+                                        st.rerun()
+                                with cc2:
+                                    st.markdown(
+                                        f'<p style="color:#bbb;font-size:0.85rem;font-family:monospace;margin:4px 0;"><s>{cur_label}</s></p>',
+                                        unsafe_allow_html=True
+                                    )
 
                     st.markdown("---")
+
+        # 下載修改後的 xlsx（如果有編輯過）
+        if st.session_state.edits and st.session_state.get("uploaded_file_bytes"):
+            st.markdown("---")
+            st.markdown("#### 📥 下載修改後的 xlsx")
+            st.caption(f"已修改 {len(st.session_state.edits)} 筆資料，下載後可取代原始檔案")
+            if st.button("產生修改後的 xlsx", use_container_width=False):
+                try:
+                    updated_bytes = apply_edits_to_xlsx(
+                        st.session_state.uploaded_file_bytes,
+                        st.session_state.selected_sheets[0] if st.session_state.selected_sheets else None,
+                        st.session_state.edits,
+                        st.session_state.tickets + st.session_state.skipped
+                    )
+                    st.download_button(
+                        "⬇️ 點此下載",
+                        data=updated_bytes,
+                        file_name=f"修改後報名表_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                except Exception as e:
+                    st.error(f"產生失敗：{e}")
 
         # 歸檔按鈕
         st.markdown("---")
@@ -963,8 +1157,17 @@ if st.session_state.rule_confirmed:
             if n_checked > 0:
                 if st.button(f"✅ 歸檔勾選的 {n_checked} 筆", type="primary", use_container_width=True):
                     to_archive = [t for t in tickets if t["key"] in st.session_state.checked_keys]
-                    keys   = [t["key"]   for t in to_archive]
-                    labels = [t["label"] for t in to_archive]
+                    keys = [t["key"] for t in to_archive]
+                    # 用編輯後的 label 歸檔
+                    def get_final_label(t):
+                        ed = st.session_state.edits.get(t["key"], {})
+                        name  = ed.get("name",  t["name"])
+                        count = ed.get("count", t["count"])
+                        parts = t["label"].split("貴賓｜")
+                        if len(parts) == 2:
+                            return f"{parts[0]}貴賓｜{name} X {count}"
+                        return f"{t['earliest_display']} {name} X {count}"
+                    labels = [get_final_label(t) for t in to_archive]
                     if save_history(HISTORY_SHEET_ID, keys, labels):
                         st.session_state.history_set.update(keys)
                         st.session_state.tickets      = [t for t in tickets if t["key"] not in st.session_state.checked_keys]
@@ -973,9 +1176,22 @@ if st.session_state.rule_confirmed:
                         st.rerun()
 
     if skipped:
-        with st.expander(f"⏭️ 略過 {len(skipped)} 筆（歷史紀錄中已列印過）"):
+        with st.expander(f"⏭️ 略過 {len(skipped)} 筆（歷史紀錄中已列印過，可取消歸檔重新列印）"):
             for t in skipped:
-                st.markdown(f'<span style="color:#aaa;font-size:0.83rem;"><s>{t["label"]}</s></span>', unsafe_allow_html=True)
+                sk1, sk2 = st.columns([1, 14])
+                with sk1:
+                    if st.button("↩️", key=f"unarchive_{t['key']}", use_container_width=True, help="取消歸檔，恢復成待列印"):
+                        if remove_history(HISTORY_SHEET_ID, [t["key"]]):
+                            st.session_state.history_set.discard(t["key"])
+                            entry = dict(t)
+                            entry["is_new"] = True
+                            st.session_state.tickets.append(entry)
+                            st.session_state.tickets.sort(key=lambda x: (x["earliest_sort"], int(x["id"])))
+                            st.session_state.skipped = [s for s in st.session_state.skipped if s["key"] != t["key"]]
+                            st.success(f"已取消歸檔：{t['label']}")
+                            st.rerun()
+                with sk2:
+                    st.markdown(f'<span style="color:#aaa;font-size:0.83rem;"><s>{t["label"]}</s></span>', unsafe_allow_html=True)
 
     st.markdown('</div>', unsafe_allow_html=True)
 

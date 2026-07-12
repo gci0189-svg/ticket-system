@@ -1,5 +1,5 @@
 """
-票務系統 v3.2 — 全面重新設計 & 公關/購票格式實體標籤適配版
+票務系統 v3.3 — 全面重新設計 & 公關/購票格式實體標籤適配版
 左側導覽切換頁面：上傳與處理 / 標籤產生 / 簽到表 / 補印 / 歷史與設定
 """
 
@@ -264,7 +264,9 @@ def parse_other_demand_sheet(df: pd.DataFrame, sheet_name: str, history_set: set
     COL_TEL = next((idx for idx, h in enumerate(headers) if "電話" in h), 7)
     COL_EMAIL = next((idx for idx, h in enumerate(headers) if "信箱" in h or "Email" in h), 8)
     COL_VENUE = next((idx for idx, h in enumerate(headers) if "場地" in h or "地點" in h), 9)
-    COL_DATE = next((idx for idx, h in enumerate(headers) if any(x in h for x in ["阿甯咕", "日期", "場次", "時間"])), 10)
+    
+    # 修正精準匹配真正的演出日期，避開「詢問時間」
+    COL_DATE = next((idx for idx, h in enumerate(headers) if any(x in h for x in ["阿甯咕", "日期", "場次"]) and "詢問" not in h), 10)
     COL_SEAT = next((idx for idx, h in enumerate(headers) if "座位" in h), 11)
 
     # 動態定位所有與張數有關的欄位（如 宜蘭場貴賓、台北場貴賓、台北場購票）
@@ -350,7 +352,7 @@ def parse_other_demand_sheet(df: pd.DataFrame, sheet_name: str, history_set: set
 
         key = f"{current_id}_{sheet_name}"
 
-        # 100% 還原實體樣式：{場次} 貴賓 | {單位} | {姓名} X {張數} (無編號前綴，類別統一為貴賓)
+        # 100% 還原實體樣式：{場次} 貴賓 | {單位} | {姓名} X {張數} (無編號前綴，類別統一為貴賓) [1]
         display_part = f"{display} 貴賓"
         detail_parts = []
         if company:
@@ -370,7 +372,7 @@ def parse_other_demand_sheet(df: pd.DataFrame, sheet_name: str, history_set: set
             "id":               current_id,
             "name":             display_name,
             "sns":              company, # 將公司單位對應至 sns 以便與 UI 和簽到表相容
-            "cat":              "貴賓",  # 統一鎖定標籤輸出類別為「貴賓」
+            "cat":              "貴賓",  # 統一鎖定標籤輸出類別為「貴賓」 [1]
             "tel":              tel,
             "email":            email,
             "venue":            venue,
@@ -565,9 +567,6 @@ def parse_label_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
             "earliest_sort":    sort_key,
             "earliest_display": display,
             "label":            label,
-            "sns":              "",
-            "tel":              "",
-            "seats":            [],
             "is_new":           key not in history_set,
             "fmt":              "label",
         }
@@ -706,7 +705,9 @@ def generate_signin_excel(file_bytes: bytes, sheet_name: str, show_name: str) ->
         COL_SNS = next((idx for idx, h in enumerate(headers) if any(x in h for x in ["社群帳號｜公司", "社群帳號|公司", "公司", "社群帳號"])), 5)
         COL_NAME = next((idx for idx, h in enumerate(headers) if "姓名" in h), 6)
         COL_TEL = next((idx for idx, h in enumerate(headers) if "電話" in h), 7)
-        COL_DATE = next((idx for idx, h in enumerate(headers) if any(x in h for x in ["阿甯咕", "日期", "場次", "時間"])), 10)
+        
+        # 修正精準匹配真正的演出日期，避開「詢問時間」
+        COL_DATE = next((idx for idx, h in enumerate(headers) if any(x in h for x in ["阿甯咕", "日期", "場次"]) and "詢問" not in h), 10)
         COL_SEAT = next((idx for idx, h in enumerate(headers) if "座位" in h), 11)
         
         # 抓取所有合法的張數加總來源欄位
@@ -941,7 +942,7 @@ def make_current_label(t: dict) -> str:
             return f"{parts[0]}貴賓｜{name} X {count}"
         return f"NO.{t['id']} {t['earliest_display']} 貴賓｜{name} X {count}"
     elif t.get("fmt") == "other_demand":
-        # 還原實體樣式：{場次} 貴賓 | {單位} | {姓名} X {張數}
+        # 還原實體樣式：{場次} 貴賓 | {單位} | {姓名} X {張數} [1]
         display_part = f"{t['earliest_display']} 貴賓"
         company = ed.get("sns", t.get("sns", ""))
         detail_parts = []

@@ -1212,6 +1212,7 @@ def parse_custom_sheet(df, sheet_name, rule):
     name_col = rule["columns"].get("姓名")
     session_col = rule["columns"].get("場次")
     count_col = rule["columns"].get("票數")
+    continuation_col = rule.get("continuation_col")
     if name_col is None or session_col is None or count_col is None:
         return tickets, ["必須指定姓名、場次和票數欄位。"]
 
@@ -1241,7 +1242,11 @@ def parse_custom_sheet(df, sheet_name, rule):
                 continue
 
         # Excel 常用合併儲存格呈現同一訂單的多列座位；續列只有座位與票數時，沿用前一筆完整訂單資料。
-        if (rule.get("merge_id") and last_complete_context and seat and count_raw
+        continuation_marker = ""
+        if continuation_col is not None and continuation_col < len(row):
+            marker_value = row.iloc[continuation_col]
+            continuation_marker = "" if pd.isna(marker_value) else str(marker_value).strip()
+        if (rule.get("merge_id") and last_complete_context and continuation_marker and count_raw
                 and not row_id and not name and not session):
             row_id, name, session = last_complete_context
 
@@ -1713,7 +1718,11 @@ if st.session_state.page == "upload":
                 required_columns={"編號": mapped["編號"], "姓名": mapped["姓名"],
                                   "場次": mapped["場次"], "票數": mapped["票數"]})
 
-            preview_rule = {"columns": mapped, "data_start": int(data_start) - 1,
+            continuation_col = mapped["座位"]
+            if continuation_col is None:
+                continuation_col = suggest_header_column(header_values, "座位")
+            preview_rule = {"columns": mapped, "continuation_col": continuation_col,
+                            "data_start": int(data_start) - 1,
                             "filter_col": mapped["列印條件"], "merge_id": merge_id,
                             "vip_format": vip_format,
                             "note_policy": note_policy}

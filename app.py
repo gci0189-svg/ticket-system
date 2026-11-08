@@ -16,7 +16,7 @@ from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-PARSER_BUILD = "2026.11.08.4"
+PARSER_BUILD = "2026.11.08.5"
 
 # ══════════════════════════════════════════════════════════
 # 頁面設定 ＆ 設計系統
@@ -414,6 +414,24 @@ def parse_session(raw: str):
         sess_str, sess_ord = "", 0
     display = f"{month}/{day} {sess_str}".strip()
     return (month, day, sess_ord), display
+
+def format_member_label_session(raw, sort_key=None):
+    """Format a member-label session as M/D 上午 or M/D 下午."""
+    sort_key = sort_key or parse_session(raw)[0]
+    month, day = sort_key[0], sort_key[1]
+    text = str(raw or "")
+    if any(marker in text for marker in ["上午", "AM", "am"]):
+        period = "上午"
+    elif any(marker in text for marker in ["下午", "PM", "pm"]):
+        period = "下午"
+    else:
+        match = re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)", text)
+        if not match:
+            return f"{month}/{day}" if month != 99 and day != 99 else ""
+        period = "上午" if int(match.group(1)) < 12 else "下午"
+    if month == 99 or day == 99:
+        return ""
+    return f"{month}/{day} {period}"
 
 def session_time_missing(raw, display):
     if not display or display.startswith("99/99"):
@@ -842,11 +860,12 @@ def parse_member_sheet(df: pd.DataFrame, sheet_name: str, note_policy=None):
     # 產生標籤
     tickets = []
     for key, info in merged.items():
-        label = (f"NO.{info['id']} {info['earliest_display']} "
+        label_session = format_member_label_session(info["earliest_display"], info["earliest_sort"])
+        label = (f"NO.{info['id']} {label_session} "
                  f"貴賓｜{info['name']} X {info['total_count']}")
         entry = {**info, "label": label, "count": info["total_count"],
                  "label_name": info["name"],
-                 "label_prefix": f"NO.{info['id']} {info['earliest_display']} 貴賓｜",
+                 "label_prefix": f"NO.{info['id']} {label_session} 貴賓｜",
                   "sns": info.get("sns",""), "tel": info.get("tel",""),
                   "seats": info.get("seats",[]), "fmt": "member"}
         tickets.append(entry)
@@ -1009,11 +1028,12 @@ def parse_taibei_sheet(df: pd.DataFrame, sheet_name: str, note_policy=None):
 
     tickets = []
     for key, info in merged.items():
-        label = (f"NO.{info['id']} {info['earliest_display']} "
+        label_session = format_member_label_session(info["earliest_display"], info["earliest_sort"])
+        label = (f"NO.{info['id']} {label_session} "
                  f"貴賓｜{info['name']} X {info['total_count']}")
         entry = {**info, "label": label, "count": info["total_count"],
                  "label_name": info["name"],
-                 "label_prefix": f"NO.{info['id']} {info['earliest_display']} 貴賓｜",
+                 "label_prefix": f"NO.{info['id']} {label_session} 貴賓｜",
                  "sns": info.get("sns",""), "tel": info.get("tel",""),
                  "seats": info.get("seats",[]), "fmt": "member"}
         tickets.append(entry)
@@ -1257,9 +1277,12 @@ def parse_custom_sheet(df, sheet_name, rule):
                 and not row_id and not name and not session):
             row_id, name, session = last_complete_context
 
-        if not name or not session or not count_raw:
+        if not name or not session or not count_raw or (rule.get("member_format") and not row_id):
             if name or session or count_raw or row_id or seat or note:
-                missing = [label for label, val in [("姓名", name), ("場次", session), ("票數", count_raw)] if not val]
+                required_values = [("編號", row_id), ("姓名", name), ("場次", session), ("票數", count_raw)]
+                if not rule.get("member_format"):
+                    required_values = required_values[1:]
+                missing = [label for label, val in required_values if not val]
                 incomplete_rows.append((row_idx + 1, "、".join(missing)))
             continue
         if rule.get("filter_col") is not None and not value("列印條件"):
@@ -1271,6 +1294,7 @@ def parse_custom_sheet(df, sheet_name, rule):
             continue
         count = int(count_match.group())
         sort_key, display = parse_session(session)
+        label_session = format_member_label_session(session, sort_key) if rule.get("member_format") else display
         if row_id and name and session:
             last_complete_context = (row_id, name, session)
         if session_time_missing(session, display):
@@ -1307,29 +1331,39 @@ def parse_custom_sheet(df, sheet_name, rule):
                 warnings.append(f"第 {row_idx + 1} 行：編號 {row_id} 對應到不同姓名，請確認是否應合併。")
             merged[key]["count"] += count
             merged[key]["total_count"] += count
-            label_name = f"{organization}｜{name}" if organization else merged[key].get("label_name", name)
+            label_name = name if rule.get("member_format") else (
+                f"{organization}｜{name}" if organization else merged[key].get("label_name", name))
             merged[key]["label_name"] = label_name
-            label_prefix = f"{display} 貴賓｜" if rule.get("vip_format") else f"{display} "
+            if rule.get("member_format"):
+                label_prefix = f"NO.{row_id} {label_session} 貴賓｜"
+            else:
+                label_prefix = f"{display} 貴賓｜" if rule.get("vip_format") else f"{display} "
             merged[key]["label_prefix"] = label_prefix
             merged[key]["organization"] = organization or merged[key].get("organization", "")
             merged[key]["label"] = f"{label_prefix}{label_name} X {merged[key]['count']}"
+            if rule.get("member_format"):
+                merged[key]["fmt"] = "member"
             if seat and seat not in merged[key]["seats"]:
                 merged[key]["seats"].append(seat)
             if change_note:
                 merged[key]["force_revision"] = True
             continue
-        label_name = f"{organization}｜{name}" if organization else name
+        label_name = name if rule.get("member_format") else (f"{organization}｜{name}" if organization else name)
+        if rule.get("member_format"):
+            label_prefix = f"NO.{row_id} {label_session} 貴賓｜"
+        else:
+            label_prefix = f"{display} {'貴賓｜' if rule.get('vip_format') else ''}"
         entry = {
             "key": key, "id": row_id or str(row_idx + 1), "name": name, "sheet": sheet_name,
             "label_name": label_name,
             "total_count": count, "count": count, "earliest_sort": sort_key,
             "earliest_display": display,
-            "label": f"{display} {'貴賓｜' if rule.get('vip_format') else ''}{label_name} X {count}",
-            "label_prefix": f"{display} {'貴賓｜' if rule.get('vip_format') else ''}",
+            "label": f"{label_prefix}{label_name} X {count}",
+            "label_prefix": label_prefix,
             "organization": organization,
             "sns": "", "tel": value("電話"), "seats": [seat] if seat else [],
             "force_revision": change_note,
-            "fmt": "custom",
+            "fmt": "member" if rule.get("member_format") else "custom",
         }
         merged[key] = entry
     for entry in merged.values():
@@ -1684,6 +1718,8 @@ if st.session_state.page == "upload":
                     st.session_state[f"data_start_{custom_key}"] = int(template.get("data_start", 2))
                     st.session_state[f"merge_id_{custom_key}"] = bool(template.get("merge_id", False))
                     st.session_state[f"vip_format_{custom_key}"] = bool(template.get("vip_format", False))
+                    st.session_state[f"member_format_{custom_key}"] = bool(template.get(
+                        "member_format", "會員" in chosen_template or "line" in chosen_template.casefold()))
                     for field in ["姓名", "場次", "座位", "票數", "電話", "編號", "列印條件", "單位／稱謂"]:
                         idx = template.get("columns", {}).get(field)
                         st.session_state[f"map_{field}_{custom_key}"] = int(idx) + 1 if isinstance(idx, int) and idx < df.shape[1] else 0
@@ -1721,9 +1757,15 @@ if st.session_state.page == "upload":
             merge_id = st.checkbox("相同編號、相同場次的多列合併票數與座位",
                 value=bool(template.get("merge_id", mapped["編號"] is not None)),
                 disabled=mapped["編號"] is None, key=f"merge_id_{custom_key}")
+            member_format = st.checkbox(
+                "使用 LINE 會員格式（NO.編號 日期 上午／下午 貴賓｜姓名）",
+                value=bool(template.get("member_format", "會員" in chosen_template or "line" in chosen_template.casefold() or "會員購票" in sname)),
+                key=f"member_format_{custom_key}")
             vip_format = st.checkbox("使用貴賓標籤格式（貴賓｜單位／稱謂｜姓名）",
                 value=bool(template.get("vip_format", mapped["單位／稱謂"] is not None)),
-                key=f"vip_format_{custom_key}")
+                disabled=member_format, key=f"vip_format_{custom_key}")
+            if member_format:
+                st.caption("標籤會自動加上 NO.編號，並將 14:30 轉為「下午」、10:30 轉為「上午」。")
             note_policy, note_pending = render_note_review(
                 df, int(data_start) - 1, custom_key, template.get("note_policy"),
                 required_columns={"編號": mapped["編號"], "姓名": mapped["姓名"],
@@ -1735,7 +1777,8 @@ if st.session_state.page == "upload":
             base_preview_rule = {"columns": mapped, "continuation_col": continuation_col,
                                  "data_start": int(data_start) - 1,
                                  "filter_col": mapped["列印條件"], "merge_id": merge_id,
-                                 "vip_format": vip_format, "note_policy": note_policy}
+                                 "vip_format": vip_format, "member_format": member_format,
+                                 "note_policy": note_policy}
             preview_rule = base_preview_rule
             preview_t, preview_w = parse_custom_sheet(df, sname, preview_rule)
             custom_blocking_warnings = [w for w in preview_w if has_blocking_warnings([w])]
@@ -1782,6 +1825,7 @@ if st.session_state.page == "upload":
                         "header_row": int(header_row), "data_start": int(data_start),
                         "columns": mapped, "merge_id": merge_id,
                         "vip_format": vip_format,
+                        "member_format": member_format,
                         "note_policy": note_policy,
                         "header_signature": normalize_headers(header_values),
                     }

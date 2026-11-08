@@ -963,6 +963,15 @@ def ticket_id_sort(ticket):
     digits = re.sub(r"\D", "", str(ticket.get("id", "")))
     return int(digits) if digits else 0
 
+def excel_column_name(index):
+    """Convert a zero-based column index to Excel's A, B, ... AA notation."""
+    number = index + 1
+    letters = ""
+    while number:
+        number, remainder = divmod(number - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters
+
 
 TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ticket_field_templates.json")
 
@@ -1079,7 +1088,7 @@ def parse_custom_sheet(df, sheet_name, history_set, rule):
     skipped.sort(key=lambda x: x["earliest_sort"])
     return tickets, skipped, warnings
 
-def render_parse_preview(tickets, skipped, warnings):
+def render_parse_preview(tickets, skipped, warnings, preview_key="default"):
     all_rows = tickets + skipped
     if st.session_state.history_available:
         st.success(f"預覽：找到 {len(all_rows)} 筆資料、共 {sum(int(t.get('count', 0)) for t in all_rows)} 張；其中 {len(skipped)} 筆已列印。")
@@ -1093,6 +1102,30 @@ def render_parse_preview(tickets, skipped, warnings):
     if warnings:
         with st.expander(f"查看 {len(warnings)} 筆資料提醒"):
             for warning in warnings[:30]: st.write(warning)
+    if st.button("🔎 開啟完整預覽視窗", key=f"open_preview_{preview_key}"):
+        show_ticket_preview_dialog(tickets, skipped, warnings)
+
+@st.dialog("解析結果預覽")
+def show_ticket_preview_dialog(tickets, skipped, warnings):
+    all_rows = tickets + skipped
+    col_a, col_b, col_c = st.columns(3)
+    col_a.metric("資料筆數", len(all_rows))
+    col_b.metric("總票數", sum(int(t.get("count", 0)) for t in all_rows))
+    col_c.metric("已列印", len(skipped) if st.session_state.history_available else "無法判斷")
+    if not st.session_state.history_available:
+        st.warning("列印歷史未連線，因此這裡無法辨識哪些資料已列印。")
+    preview_rows = [{
+        "編號": t.get("id", ""), "姓名": t.get("name", ""),
+        "場次": t.get("earliest_display", ""), "座位": "、".join(t.get("seats", [])),
+        "票數": t.get("count", 0), "電話": t.get("tel", ""),
+    } for t in all_rows]
+    if preview_rows:
+        st.dataframe(pd.DataFrame(preview_rows), hide_index=True, use_container_width=True, height=420)
+    else:
+        st.info("依照目前設定沒有解析到資料，請檢查欄位對應和資料開始列。")
+    if warnings:
+        with st.expander(f"查看 {len(warnings)} 筆解析提醒"):
+            for warning in warnings: st.write(warning)
 
 
 # ══════════════════════════════════════════════════════════
@@ -1303,7 +1336,7 @@ if st.session_state.page == "upload":
                     st.markdown(f'<div class="rule-box"><div class="rule-key">{k}</div><div class="rule-val">{v}</div></div>', unsafe_allow_html=True)
 
             preview_t, preview_s, preview_w = parse_member_sheet(df, sname, st.session_state.history_set)
-            render_parse_preview(preview_t, preview_s, preview_w)
+            render_parse_preview(preview_t, preview_s, preview_w, "member")
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("✅ 確認，前往標籤產生", type="primary", use_container_width=True,
                           disabled=(not st.session_state.history_available and not st.session_state.allow_without_history)):
@@ -1333,7 +1366,7 @@ if st.session_state.page == "upload":
                              ("排序","依最早場次"), ("輸出","每場次分組")]:
                     st.markdown(f'<div class="rule-box"><div class="rule-key">{k}</div><div class="rule-val">{v}</div></div>', unsafe_allow_html=True)
             preview_t, preview_s, preview_w = parse_taibei_sheet(df, sname, st.session_state.history_set)
-            render_parse_preview(preview_t, preview_s, preview_w)
+            render_parse_preview(preview_t, preview_s, preview_w, "taibei")
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("✅ 確認，前往標籤產生", type="primary", use_container_width=True,
                           disabled=(not st.session_state.history_available and not st.session_state.allow_without_history)):
@@ -1360,7 +1393,7 @@ if st.session_state.page == "upload":
                              ("場次欄","col12=宜蘭場貴賓、col13=台北場貴賓、col14=台北場購票"), ("輸出","每場次分組")]:
                     st.markdown(f'<div class="rule-box"><div class="rule-key">{k}</div><div class="rule-val">{v}</div></div>', unsafe_allow_html=True)
             preview_t, preview_s, preview_w = parse_other_sheet(df, sname, st.session_state.history_set)
-            render_parse_preview(preview_t, preview_s, preview_w)
+            render_parse_preview(preview_t, preview_s, preview_w, "other")
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("✅ 確認，前往標籤產生", type="primary", use_container_width=True,
                           disabled=(not st.session_state.history_available and not st.session_state.allow_without_history)):
@@ -1389,7 +1422,7 @@ if st.session_state.page == "upload":
                     st.markdown(f'<div class="rule-box"><div class="rule-key">{k}</div><div class="rule-val">{v}</div></div>', unsafe_allow_html=True)
 
             preview_t, preview_s, preview_w = parse_label_sheet(df, sname, st.session_state.history_set)
-            render_parse_preview(preview_t, preview_s, preview_w)
+            render_parse_preview(preview_t, preview_s, preview_w, "label")
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("✅ 確認，前往標籤產生", type="primary", use_container_width=True,
                           disabled=(not st.session_state.history_available and not st.session_state.allow_without_history)):
@@ -1435,18 +1468,21 @@ if st.session_state.page == "upload":
             header_idx = int(header_row) - 1
             header_values = df.iloc[header_idx].tolist() if header_idx < len(df) else []
             col_options = ["（不使用）"] + [
-                f"第 {i + 1} 欄｜{str(v).strip()[:35] or '（空白欄）'}" for i, v in enumerate(header_values)
+                f"{excel_column_name(i)} 欄｜{str(v).strip()[:35] or '（空白欄）'}"
+                for i, v in enumerate(header_values)
             ]
             def saved_col(field):
-                idx = template.get("columns", {}).get(field)
-                if isinstance(idx, int) and idx < len(header_values):
-                    return int(idx) + 1
-                suggested = suggest_header_column(header_values, field)
-                return suggested + 1 if suggested is not None else 0
-            st.caption("系統會依標題先推薦欄位，請逐項核對。姓名、場次、票數必填；座位、電話、編號和列印條件可選填。")
+                if chosen_template != "（新設定）" and field in template.get("columns", {}):
+                    idx = template["columns"].get(field)
+                    return int(idx) + 1 if isinstance(idx, int) and idx < len(header_values) else 0
+                if field in ["編號", "姓名", "場次", "票數"]:
+                    suggested = suggest_header_column(header_values, field)
+                    return suggested + 1 if suggested is not None else 0
+                return 0
+            st.caption("系統先推薦編號、姓名、場次和票數；其他欄位預設不使用。請核對欄位字母與標題。")
             if len(st.session_state.selected_sheets) != 1:
                 st.warning("自訂欄位設定目前一次處理一張工作表，請先取消其他工作表，避免把不同格式套用同一組欄位。")
-            field_names = ["姓名", "場次", "座位", "票數", "電話", "編號", "列印條件"]
+            field_names = ["編號", "姓名", "場次", "票數", "座位", "電話", "列印條件"]
             cols = st.columns(2)
             mapped = {}
             for i, field in enumerate(field_names):
@@ -1476,6 +1512,10 @@ if st.session_state.page == "upload":
                                  "座位": "、".join(t["seats"]), "票數": t["count"], "電話": t["tel"]}
                                 for t in (preview_t + preview_s)[:10]]
                 st.dataframe(pd.DataFrame(preview_rows), hide_index=True, use_container_width=True)
+                if st.button("🔄 重新解析並預覽", key=f"reparse_preview_{custom_key}", use_container_width=True):
+                    fresh_t, fresh_s, fresh_w = parse_custom_sheet(
+                        df, sname, st.session_state.history_set, preview_rule)
+                    show_ticket_preview_dialog(fresh_t, fresh_s, fresh_w)
 
             b1, b2 = st.columns([2, 1])
             with b1:

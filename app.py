@@ -1240,6 +1240,9 @@ def parse_custom_sheet(df, sheet_name, rule):
             if known_no_print:
                 excluded_notes[known_no_print] += 1
                 continue
+        elif note:
+            # A 欄只有一般備註、同列沒有購票資料時，不視為待解析的訂單。
+            continue
 
         # Excel 常用合併儲存格呈現同一訂單的多列座位；續列只有座位與票數時，沿用前一筆完整訂單資料。
         continuation_marker = ""

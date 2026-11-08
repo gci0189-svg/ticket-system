@@ -8,6 +8,7 @@ import pandas as pd
 import re
 import json
 import os
+import hashlib
 from datetime import datetime
 from io import BytesIO
 from collections import defaultdict
@@ -131,17 +132,25 @@ def get_gc():
         return None
 
 def load_history(sid: str) -> set:
+    st.session_state.allow_without_history = False
     gc = get_gc()
     if not gc or not sid:
+        st.session_state.history_available = False
+        st.session_state.history_error = "Google Sheets 尚未連線或未設定。"
         return set()
     try:
         sh = gc.open_by_key(sid)
     except gspread.exceptions.APIError as e:
-        st.warning(f"歷史紀錄試算表連線失敗（{e.response.status_code}）：請確認 Sheet ID 與服務帳戶權限")
+        code = getattr(getattr(e, "response", None), "status_code", "未知")
+        st.session_state.history_available = False
+        st.session_state.history_error = f"Google Sheets 回應 {code}；請確認試算表 ID 與服務帳戶存取權。"
         return set()
     except Exception as e:
-        st.warning(f"歷史紀錄連線失敗：{e}")
+        st.session_state.history_available = False
+        st.session_state.history_error = f"歷史紀錄連線失敗：{e}"
         return set()
+    st.session_state.history_available = True
+    st.session_state.history_error = ""
     try:
         ws = sh.worksheet("已列印紀錄")
     except gspread.exceptions.WorksheetNotFound:
@@ -152,7 +161,8 @@ def load_history(sid: str) -> set:
         vals = ws.col_values(1)
         return {v for v in vals if v and v != "唯一識別碼"}
     except Exception as e:
-        st.warning(f"讀取歷史紀錄失敗：{e}")
+        st.session_state.history_available = False
+        st.session_state.history_error = f"讀取歷史紀錄失敗：{e}"
         return set()
 
 def save_history(sid: str, keys: list, labels: list) -> bool:
@@ -169,8 +179,13 @@ def save_history(sid: str, keys: list, labels: list) -> bool:
             ws.append_row(["唯一識別碼", "列印時間", "標籤內容"])
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         ws.append_rows([[k, now, l] for k, l in zip(keys, labels)])
+        st.session_state.history_available = True
+        st.session_state.history_error = ""
         return True
     except Exception as e:
+        st.session_state.history_available = False
+        st.session_state.history_error = str(e)
+        st.session_state.allow_without_history = False
         st.error(f"儲存失敗：{e}")
         return False
 
@@ -374,7 +389,7 @@ def generate_signin_excel(file_bytes: bytes, sheet_name: str, show_name: str) ->
                 if s: merged[last_id]["seats"].append(s)
         merged[last_id]["total"] += count
 
-    sorted_data = sorted(merged.values(), key=lambda x: (x["sort"], int(x["id"])))
+    sorted_data = sorted(merged.values(), key=lambda x: (x["sort"], ticket_id_sort(x)))
     sessions = defaultdict(list)
     for r in sorted_data:
         sessions[r["session"]].append(r)
@@ -585,8 +600,8 @@ def parse_label_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
     # 分開 new / skipped
     tickets = [r for r in results if r["is_new"]]
     skipped = [r for r in results if not r["is_new"]]
-    tickets.sort(key=lambda x: (x["earliest_sort"], int(x["id"])))
-    skipped.sort(key=lambda x: (x["earliest_sort"], int(x["id"])))
+    tickets.sort(key=lambda x: (x["earliest_sort"], ticket_id_sort(x)))
+    skipped.sort(key=lambda x: (x["earliest_sort"], ticket_id_sort(x)))
     return tickets, skipped, warnings
 
 def parse_member_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
@@ -944,6 +959,10 @@ def group_by_session(tickets: list) -> dict:
         grouped.setdefault(d, []).append(t)
     return dict(sorted(grouped.items(), key=lambda x: x[1][0]["earliest_sort"]))
 
+def ticket_id_sort(ticket):
+    digits = re.sub(r"\D", "", str(ticket.get("id", "")))
+    return int(digits) if digits else 0
+
 
 TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ticket_field_templates.json")
 
@@ -959,9 +978,40 @@ def save_field_templates(templates):
     with open(TEMPLATE_PATH, "w", encoding="utf-8") as f:
         json.dump(templates, f, ensure_ascii=False, indent=2)
 
+def normalize_headers(values):
+    return [re.sub(r"\s+", "", str(v or "")).casefold() for v in values]
+
+def recommend_field_template(df, templates):
+    for name, template in templates.items():
+        row_idx = int(template.get("header_row", 1)) - 1
+        if row_idx < 0 or row_idx >= len(df):
+            continue
+        actual = normalize_headers(df.iloc[row_idx].tolist())
+        saved = template.get("header_signature")
+        if saved and actual == saved:
+            return name
+    return None
+
+def suggest_header_column(headers, field):
+    keywords = {
+        "姓名": ["姓名", "訂購人", "購票人", "會員名稱"],
+        "場次": ["場次", "演出時間", "活動時間", "日期場次"],
+        "座位": ["座位", "座號", "席位"],
+        "票數": ["票數", "張數", "數量", "票券數"],
+        "電話": ["電話", "手機", "聯絡電話"],
+        "編號": ["編號", "訂單編號", "序號", "流水號"],
+        "列印條件": ["現場取票", "取票方式", "領票方式", "列印條件"],
+    }
+    for idx, header in enumerate(headers):
+        text = re.sub(r"\s+", "", str(header or ""))
+        if text and any(word in text for word in keywords[field]):
+            return idx
+    return None
+
 def parse_custom_sheet(df, sheet_name, history_set, rule):
     """Parse a simple row-oriented sheet using user-mapped columns."""
     tickets, skipped, warnings = [], [], []
+    merged = {}
     name_col = rule["columns"].get("姓名")
     session_col = rule["columns"].get("場次")
     count_col = rule["columns"].get("票數")
@@ -982,6 +1032,9 @@ def parse_custom_sheet(df, sheet_name, history_set, rule):
 
         name, session, count_raw = value("姓名"), value("場次"), value("票數")
         if not name or not session or not count_raw:
+            if sum(bool(v) for v in (name, session, count_raw)) >= 2 or name or session:
+                missing = [label for label, val in [("姓名", name), ("場次", session), ("票數", count_raw)] if not val]
+                warnings.append(f"第 {row_idx + 1} 行：缺少{'、'.join(missing)}，已略過。")
             continue
         if rule.get("filter_col") is not None and not value("列印條件"):
             continue
@@ -993,22 +1046,53 @@ def parse_custom_sheet(df, sheet_name, history_set, rule):
         row_id = value("編號")
         sort_key, display = parse_session(session)
         seat = value("座位")
-        identity = row_id or "_".join([name, session, seat, str(count)])
-        identity = re.sub(r"\s+", "", identity)
-        occurrence_key = f"{identity}_{sheet_name}"
-        key_occurrences[occurrence_key] += 1
-        key = f"custom_{occurrence_key}_{key_occurrences[occurrence_key]}"
+        if display == "99/99":
+            warnings.append(f"第 {row_idx + 1} 行：無法辨識場次「{session}」，請在預覽中確認。")
+        if rule.get("merge_id") and row_id:
+            normalized_id = re.sub(r"\s+", "", row_id)
+            key = f"custom_{normalized_id}_{sheet_name}_{display}"
+        else:
+            identity = row_id or "_".join([name, session, seat])
+            identity = re.sub(r"\s+", "", identity)
+            occurrence_key = f"{identity}_{sheet_name}"
+            key_occurrences[occurrence_key] += 1
+            key = f"custom_{occurrence_key}_{key_occurrences[occurrence_key]}"
+        if key in merged:
+            if merged[key]["name"] != name:
+                warnings.append(f"第 {row_idx + 1} 行：編號 {row_id} 對應到不同姓名，請確認是否應合併。")
+            merged[key]["count"] += count
+            merged[key]["total_count"] += count
+            if seat and seat not in merged[key]["seats"]:
+                merged[key]["seats"].append(seat)
+            continue
         entry = {
-            "key": key, "id": row_id, "name": name, "sheet": sheet_name,
+            "key": key, "id": row_id or str(row_idx + 1), "name": name, "sheet": sheet_name,
             "total_count": count, "count": count, "earliest_sort": sort_key,
             "earliest_display": display, "label": f"{display} {name} X {count}",
             "sns": "", "tel": value("電話"), "seats": [seat] if seat else [],
             "is_new": key not in history_set, "fmt": "custom",
         }
+        merged[key] = entry
+    for entry in merged.values():
         (tickets if entry["is_new"] else skipped).append(entry)
     tickets.sort(key=lambda x: x["earliest_sort"])
     skipped.sort(key=lambda x: x["earliest_sort"])
     return tickets, skipped, warnings
+
+def render_parse_preview(tickets, skipped, warnings):
+    all_rows = tickets + skipped
+    if st.session_state.history_available:
+        st.success(f"預覽：找到 {len(all_rows)} 筆資料、共 {sum(int(t.get('count', 0)) for t in all_rows)} 張；其中 {len(skipped)} 筆已列印。")
+    else:
+        st.info(f"預覽：找到 {len(all_rows)} 筆資料、共 {sum(int(t.get('count', 0)) for t in all_rows)} 張。列印歷史未連線，無法比對已列印項目。")
+    sample = [{"編號": t.get("id", ""), "姓名": t.get("name", ""),
+               "場次": t.get("earliest_display", ""), "座位": "、".join(t.get("seats", [])),
+               "張數": t.get("count", 0)} for t in all_rows[:8]]
+    if sample:
+        st.dataframe(pd.DataFrame(sample), hide_index=True, use_container_width=True)
+    if warnings:
+        with st.expander(f"查看 {len(warnings)} 筆資料提醒"):
+            for warning in warnings[:30]: st.write(warning)
 
 
 # ══════════════════════════════════════════════════════════
@@ -1027,14 +1111,23 @@ defaults = {
     "checked_keys":        set(),
     "edits":               {},
     "uploaded_file_bytes": None,
+    "uploaded_workbook_hash": "",
+    "uploaded_file_name": "",
+    "upload_widget_version": 0,
     "field_templates": load_field_templates(),
+    "history_loaded": False,
+    "history_available": False,
+    "history_error": "",
+    "allow_without_history": False,
+    "label_search": "",
 }
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-if not st.session_state.history_set:
+if not st.session_state.history_loaded:
     st.session_state.history_set = load_history(HISTORY_SHEET_ID)
+    st.session_state.history_loaded = True
 
 
 # ══════════════════════════════════════════════════════════
@@ -1073,12 +1166,15 @@ with st.sidebar:
             st.rerun()
 
     st.markdown('<div class="nav-title">即時狀態</div>', unsafe_allow_html=True)
+    history_count_display = len(st.session_state.history_set) if st.session_state.history_available else "—"
     st.markdown(
         f'<div class="stat-pill" style="margin-bottom:0.5rem;">'
-        f'<div class="num">{len(st.session_state.history_set)}</div>'
+        f'<div class="num">{history_count_display}</div>'
         f'<div class="lbl">已列印歷史筆數</div></div>',
         unsafe_allow_html=True
     )
+    history_label = "🟢 列印歷史已連線" if st.session_state.history_available else "🔴 列印歷史未連線"
+    st.caption(history_label)
     if st.session_state.tickets:
         n_checked = len(st.session_state.checked_keys)
         st.markdown(
@@ -1105,20 +1201,32 @@ st.markdown(f"""
 # ══════════════════════════════════════════════════════════
 if st.session_state.page == "upload":
 
+    if not st.session_state.history_available:
+        st.warning(f"列印歷史目前無法連線：{st.session_state.history_error} 在修復前，系統無法可靠判斷哪些資料已列印。若仍要繼續，請先勾選下方確認。")
+        if st.button("🔄 重試列印歷史連線", key="retry_history_upload"):
+            st.session_state.history_set = load_history(HISTORY_SHEET_ID)
+            st.session_state.history_loaded = True
+            st.rerun()
+
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown('<div class="card-title">① 上傳 xlsx 報名表</div>', unsafe_allow_html=True)
-    uploaded = st.file_uploader("選取或拖曳 xlsx 檔案", type=["xlsx"], label_visibility="collapsed")
+    st.caption("名單會暫存在目前工作階段供標籤與簽到表使用；作業完成後，可到「歷史與設定」清除本次資料。")
+    uploaded = st.file_uploader("選取或拖曳 xlsx 檔案", type=["xlsx"], label_visibility="collapsed",
+                                key=f"workbook_uploader_{st.session_state.upload_widget_version}")
     if uploaded:
         try:
-            file_bytes = uploaded.read()
+            file_bytes = uploaded.getvalue()
+            workbook_hash = hashlib.sha256(file_bytes).hexdigest()
             st.session_state.uploaded_file_bytes = file_bytes
-            xls = pd.ExcelFile(BytesIO(file_bytes))
-            raw = {}
-            for sname in xls.sheet_names:
-                df = pd.read_excel(xls, sheet_name=sname, header=None, dtype=str)
-                raw[sname] = df.fillna("")
-            if set(raw.keys()) != set(st.session_state.raw_sheets.keys()):
+            st.session_state.uploaded_file_name = uploaded.name
+            if workbook_hash != st.session_state.uploaded_workbook_hash:
+                xls = pd.ExcelFile(BytesIO(file_bytes))
+                raw = {}
+                for sname in xls.sheet_names:
+                    df = pd.read_excel(xls, sheet_name=sname, header=None, dtype=str)
+                    raw[sname] = df.fillna("")
                 st.session_state.raw_sheets      = raw
+                st.session_state.uploaded_workbook_hash = workbook_hash
                 st.session_state.selected_sheets = []
                 st.session_state.rule_confirmed  = False
                 st.session_state.tickets         = []
@@ -1126,10 +1234,15 @@ if st.session_state.page == "upload":
                 st.session_state.warnings        = []
                 st.session_state.checked_keys    = set()
                 st.session_state.edits           = {}
-            st.markdown(f'<div class="note-ok">✅ 已載入：{uploaded.name}，共 {len(raw)} 個工作表</div>', unsafe_allow_html=True)
+                st.session_state.allow_without_history = False
+                st.session_state.label_search = ""
+            st.markdown(f'<div class="note-ok">✅ 已載入：{uploaded.name}，共 {len(st.session_state.raw_sheets)} 個工作表</div>', unsafe_allow_html=True)
         except Exception as e:
             st.error(f"讀取失敗：{e}")
     st.markdown('</div>', unsafe_allow_html=True)
+
+    if not st.session_state.history_available:
+        st.checkbox("我了解本次無法排除已列印資料，仍要繼續", key="allow_without_history")
 
     if st.session_state.raw_sheets:
         st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -1189,14 +1302,17 @@ if st.session_state.page == "upload":
                              ("排序","依最早場次"), ("輸出","每場次／工作表分組")]:
                     st.markdown(f'<div class="rule-box"><div class="rule-key">{k}</div><div class="rule-val">{v}</div></div>', unsafe_allow_html=True)
 
+            preview_t, preview_s, preview_w = parse_member_sheet(df, sname, st.session_state.history_set)
+            render_parse_preview(preview_t, preview_s, preview_w)
             st.markdown("<br>", unsafe_allow_html=True)
-            if st.button("✅ 確認，前往標籤產生", type="primary", use_container_width=True):
+            if st.button("✅ 確認，前往標籤產生", type="primary", use_container_width=True,
+                          disabled=(not st.session_state.history_available and not st.session_state.allow_without_history)):
                 with st.spinner("解析中..."):
                     all_t, all_s, all_w = [], [], []
                     for sh in st.session_state.selected_sheets:
                         t, s, w = parse_member_sheet(st.session_state.raw_sheets[sh], sh, st.session_state.history_set)
                         all_t.extend(t); all_s.extend(s); all_w.extend(w)
-                    all_t.sort(key=lambda x: (x["earliest_sort"], int(x["id"])))
+                    all_t.sort(key=lambda x: (x["earliest_sort"], ticket_id_sort(x)))
                 st.session_state.tickets        = all_t
                 st.session_state.skipped        = all_s
                 st.session_state.warnings       = all_w
@@ -1216,14 +1332,17 @@ if st.session_state.page == "upload":
                 for k, v in [("唯一識別碼","編號＋工作表名稱"), ("標籤格式","NO.{編號} {最早場次} 貴賓｜{姓名} X {總張數}"),
                              ("排序","依最早場次"), ("輸出","每場次分組")]:
                     st.markdown(f'<div class="rule-box"><div class="rule-key">{k}</div><div class="rule-val">{v}</div></div>', unsafe_allow_html=True)
+            preview_t, preview_s, preview_w = parse_taibei_sheet(df, sname, st.session_state.history_set)
+            render_parse_preview(preview_t, preview_s, preview_w)
             st.markdown("<br>", unsafe_allow_html=True)
-            if st.button("✅ 確認，前往標籤產生", type="primary", use_container_width=True):
+            if st.button("✅ 確認，前往標籤產生", type="primary", use_container_width=True,
+                          disabled=(not st.session_state.history_available and not st.session_state.allow_without_history)):
                 with st.spinner("解析中..."):
                     all_t, all_s, all_w = [], [], []
                     for sh in st.session_state.selected_sheets:
                         t, s, w = parse_taibei_sheet(st.session_state.raw_sheets[sh], sh, st.session_state.history_set)
                         all_t.extend(t); all_s.extend(s); all_w.extend(w)
-                    all_t.sort(key=lambda x: (x["earliest_sort"], int(x["id"])))
+                    all_t.sort(key=lambda x: (x["earliest_sort"], ticket_id_sort(x)))
                 st.session_state.tickets = all_t; st.session_state.skipped = all_s
                 st.session_state.warnings = all_w; st.session_state.rule_confirmed = True
                 st.session_state.checked_keys = set(); st.session_state.page = "labels"
@@ -1240,14 +1359,17 @@ if st.session_state.page == "upload":
                 for k, v in [("唯一識別碼","姓名＋場次＋工作表名稱"), ("標籤格式","{場次} 貴賓｜{公司}｜{姓名} X {張數}"),
                              ("場次欄","col12=宜蘭場貴賓、col13=台北場貴賓、col14=台北場購票"), ("輸出","每場次分組")]:
                     st.markdown(f'<div class="rule-box"><div class="rule-key">{k}</div><div class="rule-val">{v}</div></div>', unsafe_allow_html=True)
+            preview_t, preview_s, preview_w = parse_other_sheet(df, sname, st.session_state.history_set)
+            render_parse_preview(preview_t, preview_s, preview_w)
             st.markdown("<br>", unsafe_allow_html=True)
-            if st.button("✅ 確認，前往標籤產生", type="primary", use_container_width=True):
+            if st.button("✅ 確認，前往標籤產生", type="primary", use_container_width=True,
+                          disabled=(not st.session_state.history_available and not st.session_state.allow_without_history)):
                 with st.spinner("解析中..."):
                     all_t, all_s, all_w = [], [], []
                     for sh in st.session_state.selected_sheets:
                         t, s, w = parse_other_sheet(st.session_state.raw_sheets[sh], sh, st.session_state.history_set)
                         all_t.extend(t); all_s.extend(s); all_w.extend(w)
-                    all_t.sort(key=lambda x: (x["earliest_sort"], int(x["id"])))
+                    all_t.sort(key=lambda x: (x["earliest_sort"], ticket_id_sort(x)))
                 st.session_state.tickets = all_t; st.session_state.skipped = all_s
                 st.session_state.warnings = all_w; st.session_state.rule_confirmed = True
                 st.session_state.checked_keys = set(); st.session_state.page = "labels"
@@ -1266,14 +1388,17 @@ if st.session_state.page == "upload":
                              ("排序","依日期場次"), ("輸出","每場次／工作表分組")]:
                     st.markdown(f'<div class="rule-box"><div class="rule-key">{k}</div><div class="rule-val">{v}</div></div>', unsafe_allow_html=True)
 
+            preview_t, preview_s, preview_w = parse_label_sheet(df, sname, st.session_state.history_set)
+            render_parse_preview(preview_t, preview_s, preview_w)
             st.markdown("<br>", unsafe_allow_html=True)
-            if st.button("✅ 確認，前往標籤產生", type="primary", use_container_width=True):
+            if st.button("✅ 確認，前往標籤產生", type="primary", use_container_width=True,
+                          disabled=(not st.session_state.history_available and not st.session_state.allow_without_history)):
                 with st.spinner("解析中..."):
                     all_t, all_s, all_w = [], [], []
                     for sh in st.session_state.selected_sheets:
                         t, s, w = parse_label_sheet(st.session_state.raw_sheets[sh], sh, st.session_state.history_set)
                         all_t.extend(t); all_s.extend(s); all_w.extend(w)
-                    all_t.sort(key=lambda x: (x["earliest_sort"], int(x["id"])))
+                    all_t.sort(key=lambda x: (x["earliest_sort"], ticket_id_sort(x)))
                 st.session_state.tickets        = all_t
                 st.session_state.skipped        = all_s
                 st.session_state.warnings       = all_w
@@ -1283,19 +1408,25 @@ if st.session_state.page == "upload":
                 st.rerun()
         else:
             st.markdown('<div class="note-info">這張表格尚未有內建規則。你可以在下方指定欄位，預覽解析結果，並儲存格式供下次重用。</div>', unsafe_allow_html=True)
-            custom_key = re.sub(r"[^a-zA-Z0-9_]", "_", sname)
+            custom_key = f"{st.session_state.uploaded_workbook_hash[:10]}_" + re.sub(r"[^a-zA-Z0-9_]", "_", sname)
             templates = st.session_state.field_templates
             saved_names = ["（新設定）"] + list(templates.keys())
-            chosen_template = st.selectbox("套用已儲存的格式", saved_names, key=f"template_select_{custom_key}")
+            recommended = recommend_field_template(df, templates)
+            recommended_index = saved_names.index(recommended) if recommended in saved_names else 0
+            chosen_template = st.selectbox("套用已儲存的格式", saved_names, index=recommended_index,
+                                           key=f"template_select_{custom_key}")
             template = templates.get(chosen_template, {})
+            if recommended:
+                st.caption(f"依欄位標題推薦格式：{recommended}。請載入並檢查預覽後再確認。")
 
             if chosen_template != "（新設定）":
                 if st.button("📂 載入這套欄位設定", key=f"load_template_{custom_key}"):
                     st.session_state[f"header_row_{custom_key}"] = int(template.get("header_row", 1))
                     st.session_state[f"data_start_{custom_key}"] = int(template.get("data_start", 2))
+                    st.session_state[f"merge_id_{custom_key}"] = bool(template.get("merge_id", False))
                     for field in ["姓名", "場次", "座位", "票數", "電話", "編號", "列印條件"]:
                         idx = template.get("columns", {}).get(field)
-                        st.session_state[f"map_{field}_{custom_key}"] = int(idx) + 1 if isinstance(idx, int) else 0
+                        st.session_state[f"map_{field}_{custom_key}"] = int(idx) + 1 if isinstance(idx, int) and idx < df.shape[1] else 0
                     st.rerun()
 
             max_rows = max(1, min(len(df), 30))
@@ -1308,8 +1439,11 @@ if st.session_state.page == "upload":
             ]
             def saved_col(field):
                 idx = template.get("columns", {}).get(field)
-                return int(idx) + 1 if isinstance(idx, int) and idx < len(header_values) else 0
-            st.caption("請把每個用途對應到 Excel 欄位。姓名、場次、票數為必填；座位、電話、編號和列印條件可不設定。")
+                if isinstance(idx, int) and idx < len(header_values):
+                    return int(idx) + 1
+                suggested = suggest_header_column(header_values, field)
+                return suggested + 1 if suggested is not None else 0
+            st.caption("系統會依標題先推薦欄位，請逐項核對。姓名、場次、票數必填；座位、電話、編號和列印條件可選填。")
             if len(st.session_state.selected_sheets) != 1:
                 st.warning("自訂欄位設定目前一次處理一張工作表，請先取消其他工作表，避免把不同格式套用同一組欄位。")
             field_names = ["姓名", "場次", "座位", "票數", "電話", "編號", "列印條件"]
@@ -1321,14 +1455,20 @@ if st.session_state.page == "upload":
                 mapped[field] = None if selected == "（不使用）" else col_options.index(selected) - 1
             data_start = st.number_input("資料開始列（從 1 開始）", min_value=1, max_value=max(1, len(df)),
                 value=int(template.get("data_start", max(2, int(header_row) + 1))), key=f"data_start_{custom_key}")
+            merge_id = st.checkbox("相同編號、相同場次的多列合併票數與座位",
+                value=bool(template.get("merge_id", mapped["編號"] is not None)),
+                disabled=mapped["編號"] is None, key=f"merge_id_{custom_key}")
 
             preview_rule = {"columns": mapped, "data_start": int(data_start) - 1,
-                            "filter_col": mapped["列印條件"]}
+                            "filter_col": mapped["列印條件"], "merge_id": merge_id}
             preview_t, preview_s, preview_w = parse_custom_sheet(df, sname, st.session_state.history_set, preview_rule)
             if mapped["姓名"] is None or mapped["場次"] is None or mapped["票數"] is None:
                 st.warning("請先指定姓名、場次和票數欄位。")
             else:
-                st.success(f"預覽解析到 {len(preview_t) + len(preview_s)} 筆有效資料（其中 {len(preview_s)} 筆已在歷史紀錄中）。")
+                if st.session_state.history_available:
+                    st.success(f"預覽解析到 {len(preview_t) + len(preview_s)} 筆有效資料（其中 {len(preview_s)} 筆已在歷史紀錄中）。")
+                else:
+                    st.info(f"預覽解析到 {len(preview_t) + len(preview_s)} 筆有效資料。列印歷史未連線，無法判斷是否已印。")
                 if preview_w:
                     with st.expander(f"查看 {len(preview_w)} 筆解析提醒"):
                         for warning in preview_w[:20]: st.write(warning)
@@ -1344,7 +1484,11 @@ if st.session_state.page == "upload":
                 st.markdown("<br>", unsafe_allow_html=True)
                 if st.button("💾 儲存格式", key=f"save_template_{custom_key}", use_container_width=True,
                              disabled=not template_name.strip() or mapped["姓名"] is None or mapped["場次"] is None or mapped["票數"] is None):
-                    templates[template_name.strip()] = {"header_row": int(header_row), "data_start": int(data_start), "columns": mapped}
+                    templates[template_name.strip()] = {
+                        "header_row": int(header_row), "data_start": int(data_start),
+                        "columns": mapped, "merge_id": merge_id,
+                        "header_signature": normalize_headers(header_values),
+                    }
                     try:
                         save_field_templates(templates)
                         st.session_state.field_templates = templates
@@ -1353,7 +1497,7 @@ if st.session_state.page == "upload":
                         st.error(f"無法儲存格式設定：{e}")
 
             if st.button("✅ 確認設定，前往標籤產生", type="primary", use_container_width=True,
-                         key=f"apply_custom_{custom_key}", disabled=(mapped["姓名"] is None or mapped["場次"] is None or mapped["票數"] is None or len(st.session_state.selected_sheets) != 1)):
+                         key=f"apply_custom_{custom_key}", disabled=(mapped["姓名"] is None or mapped["場次"] is None or mapped["票數"] is None or len(st.session_state.selected_sheets) != 1 or (not st.session_state.history_available and not st.session_state.allow_without_history))):
                 with st.spinner("依照欄位設定解析中..."):
                     all_t, all_s, all_w = [], [], []
                     for sh in st.session_state.selected_sheets:
@@ -1375,8 +1519,10 @@ if st.session_state.page == "upload":
 # ══════════════════════════════════════════════════════════
 elif st.session_state.page == "labels":
 
-    if not st.session_state.rule_confirmed or not st.session_state.tickets and not st.session_state.skipped:
+    if not st.session_state.rule_confirmed:
         st.markdown('<div class="note-info">請先到「📤 上傳與處理」完成上傳與規則確認。</div>', unsafe_allow_html=True)
+    elif not st.session_state.tickets and not st.session_state.skipped:
+        st.warning("解析完成，但沒有找到可列印資料。請回到「上傳與處理」檢查欄位對應、資料開始列與列印條件。")
     else:
         tickets  = st.session_state.tickets
         skipped  = st.session_state.skipped
@@ -1386,6 +1532,9 @@ elif st.session_state.page == "labels":
             with st.expander(f"⚠️ {len(warnings)} 筆資料需要注意"):
                 for w in warnings:
                     st.markdown(f"- {w}")
+
+        if not st.session_state.history_available:
+            st.warning("列印歷史未連線。本次資料無法自動略過已印項目，也無法安全歸檔；請修復連線後再列印。")
 
         total_count = sum(t["count"] for t in tickets)
         n_sessions  = len(set(t["earliest_display"] for t in tickets))
@@ -1407,7 +1556,8 @@ elif st.session_state.page == "labels":
             with col_a1:
                 st.markdown(f'<div class="note-info">已勾選 <strong>{n_checked}</strong> 筆（可能跨多個場次），歸檔後下次不再出現。</div>', unsafe_allow_html=True)
             with col_a2:
-                if st.button(f"✅ 歸檔勾選的 {n_checked} 筆", type="primary", use_container_width=True):
+                if st.button(f"✅ 歸檔勾選的 {n_checked} 筆", type="primary", use_container_width=True,
+                             disabled=not st.session_state.history_available):
                     to_archive = [t for t in tickets if t["key"] in st.session_state.checked_keys]
                     keys   = [t["key"] for t in to_archive]
                     labels = [make_current_label(t) for t in to_archive]
@@ -1418,8 +1568,18 @@ elif st.session_state.page == "labels":
                         st.success(f"✅ 已歸檔 {len(keys)} 筆！")
                         st.rerun()
 
+        search_query = st.text_input("🔎 搜尋姓名、編號、電話或座位", key="label_search").strip().casefold()
+        if search_query:
+            tickets = [t for t in tickets if search_query in " ".join([
+                str(t.get("name", "")), str(t.get("id", "")), str(t.get("tel", "")),
+                " ".join(t.get("seats", [])), str(t.get("earliest_display", "")),
+            ]).casefold()]
+
         if not tickets:
-            st.markdown('<div class="note-ok">🎉 沒有待列印資料，全部都已處理完成。</div>', unsafe_allow_html=True)
+            if search_query:
+                st.info(f"找不到符合「{search_query}」的待列印資料。")
+            else:
+                st.markdown('<div class="note-ok">🎉 沒有待列印資料，全部都已處理完成。</div>', unsafe_allow_html=True)
         else:
             grouped = group_by_session(tickets)
             session_names = list(grouped.keys())
@@ -1590,7 +1750,7 @@ elif st.session_state.page == "signin":
             all_tickets = st.session_state.tickets + st.session_state.skipped
             if all_tickets:
                 preview_sessions = defaultdict(list)
-                for t in sorted(all_tickets, key=lambda x: (x["earliest_sort"], int(x["id"]))):
+                for t in sorted(all_tickets, key=lambda x: (x["earliest_sort"], ticket_id_sort(x))):
                     preview_sessions[t["earliest_display"]].append(t)
 
                 st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -1621,7 +1781,7 @@ elif st.session_state.page == "reprint":
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown('<div class="card-title">🖨️ 補印（不受歷史紀錄限制，可重複產生）</div>', unsafe_allow_html=True)
-    st.caption("輸入編號重新產生標籤，例如：4 或 4,7,12")
+    st.caption("可輸入編號，或用姓名／電話搜尋，例如：4,7,12 或 王小明")
 
     col_in, col_btn = st.columns([4, 1])
     with col_in:
@@ -1631,12 +1791,18 @@ elif st.session_state.page == "reprint":
 
     if do_reprint and reprint_id:
         tickets_now = st.session_state.get("tickets", []) + st.session_state.get("skipped", [])
-        ids = [x.strip() for x in reprint_id.replace("，", ",").split(",") if x.strip()]
-        found = [t for t in tickets_now if t["id"] in ids]
+        terms = [x.strip() for x in reprint_id.replace("，", ",").split(",") if x.strip()]
+        if terms and all(re.fullmatch(r"\d+", term) for term in terms):
+            found = [t for t in tickets_now if str(t.get("id", "")) in terms]
+        else:
+            found = [t for t in tickets_now if any(term.casefold() in " ".join([
+                str(t.get("name", "")), str(t.get("tel", "")), str(t.get("id", "")),
+                " ".join(t.get("seats", [])),
+            ]).casefold() for term in terms)]
         if found:
             st.code("\n".join(make_current_label(t) for t in found), language=None)
         else:
-            st.markdown(f'<div class="note-warn">找不到編號：{", ".join(ids)}（請先完成上傳與標籤產生）</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="note-warn">找不到符合「{", ".join(terms)}」的資料（請先完成上傳與標籤產生）</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 
@@ -1647,19 +1813,29 @@ elif st.session_state.page == "settings":
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown('<div class="card-title">📦 歷史紀錄</div>', unsafe_allow_html=True)
+    if not st.session_state.history_available:
+        st.warning(f"目前無法讀取列印歷史：{st.session_state.history_error}")
     col_h1, col_h2, col_h3 = st.columns([2, 1, 1])
     with col_h1:
-        st.markdown(f'<div class="stat-pill"><div class="num">{len(st.session_state.history_set)}</div><div class="lbl">已列印歷史筆數</div></div>', unsafe_allow_html=True)
+        history_count_display = len(st.session_state.history_set) if st.session_state.history_available else "—"
+        st.markdown(f'<div class="stat-pill"><div class="num">{history_count_display}</div><div class="lbl">已列印歷史筆數</div></div>', unsafe_allow_html=True)
     with col_h2:
         if st.button("🔄 重新載入歷史", use_container_width=True):
             with st.spinner("連線中..."):
                 st.session_state.history_set = load_history(HISTORY_SHEET_ID)
-            st.success(f"已載入 {len(st.session_state.history_set)} 筆")
+                st.session_state.history_loaded = True
+            if st.session_state.history_available:
+                st.success(f"已載入 {len(st.session_state.history_set)} 筆歷史紀錄。")
+            else:
+                st.error(f"載入失敗：{st.session_state.history_error}")
     with col_h3:
         if st.button("🗑️ 重新開始（清除本次資料）", use_container_width=True):
             for k in ["raw_sheets","selected_sheets","rule_confirmed","tickets","skipped",
-                      "warnings","checked_keys","edits","uploaded_file_bytes"]:
+                      "warnings","checked_keys","edits","uploaded_file_bytes","uploaded_file_name",
+                      "uploaded_workbook_hash","label_search"]:
                 st.session_state[k] = defaults[k]
+            st.session_state.upload_widget_version += 1
+            st.session_state.allow_without_history = False
             st.success("已清除，請重新上傳")
             st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
@@ -1677,7 +1853,7 @@ elif st.session_state.page == "settings":
                         entry = dict(t)
                         entry["is_new"] = True
                         st.session_state.tickets.append(entry)
-                        st.session_state.tickets.sort(key=lambda x: (x["earliest_sort"], int(x["id"])))
+                        st.session_state.tickets.sort(key=lambda x: (x["earliest_sort"], ticket_id_sort(x)))
                         st.session_state.skipped = [s for s in st.session_state.skipped if s["key"] != t["key"]]
                         st.success(f"已取消歸檔：{t['label']}")
                         st.rerun()
@@ -1686,3 +1862,4 @@ elif st.session_state.page == "settings":
         st.markdown('</div>', unsafe_allow_html=True)
     else:
         st.markdown('<div class="note-info">目前沒有本次已列印過的資料紀錄可顯示。</div>', unsafe_allow_html=True)
+

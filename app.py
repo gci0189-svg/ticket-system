@@ -16,7 +16,7 @@ from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-PARSER_BUILD = "2026.11.08.3"
+PARSER_BUILD = "2026.11.08.4"
 
 # ══════════════════════════════════════════════════════════
 # 頁面設定 ＆ 設計系統
@@ -534,7 +534,7 @@ def append_rule_exclusion_summary(warnings, reason, count):
 def has_blocking_warnings(warnings):
     informational_prefixes = (
         "已依 A 欄備註排除不需列印資料：",
-        "依照本次逐筆確認排除資料：",
+        "因必要欄位不完整而略過資料：",
         "依照「現場取票欄」排除",
         "依照「自訂列印條件」排除",
     )
@@ -597,65 +597,6 @@ def render_note_review(df, data_start, key, saved_policy=None, required_columns=
     policy = {str(r["A 欄備註"]): str(r["處理方式"]) for _, r in edited.iterrows()}
     unresolved = sum(int(r["筆數"]) for _, r in edited.iterrows() if r["處理方式"] == "待確認")
     return policy, unresolved
-
-def render_incomplete_row_review(df, warnings, columns, key, data_start):
-    """Require an explicit per-row decision before incomplete records can be left out."""
-    issue_map = defaultdict(list)
-    for warning in warnings:
-        match = re.match(r"第 (\d+) 行：", str(warning))
-        if match:
-            row_number = int(match.group(1))
-            if row_number > data_start:
-                issue_map[row_number].append(str(warning))
-    if not issue_map:
-        return set(), 0
-
-    def cell(row, col):
-        if col is None or col < 0 or col >= len(row):
-            return ""
-        value = row.iloc[col]
-        return "" if value is None or pd.isna(value) else str(value).strip()
-
-    records = []
-    for row_number, row_issues in sorted(issue_map.items()):
-        row = df.iloc[row_number - 1]
-        records.append({
-            "Excel列": row_number,
-            "編號": cell(row, columns.get("編號")),
-            "帳號名稱": cell(row, columns.get("帳號名稱")),
-            "姓名": cell(row, columns.get("姓名")),
-            "場次": cell(row, columns.get("場次")),
-            "票數": cell(row, columns.get("票數")),
-            "A欄備註": get_note_text(row.tolist()),
-            "待處理原因": "；".join(row_issues),
-            "本次處理": "待確認",
-        })
-
-    st.markdown("**缺漏資料逐筆確認**")
-    st.caption("需要列印的訂單請回 Excel 補齊後重新上傳；只有確認不屬於本次列印的資料，才選「本次不列印」。所有列都完成選擇後才能繼續。")
-    edited = st.data_editor(
-        pd.DataFrame(records),
-        column_config={
-            "Excel列": st.column_config.NumberColumn("Excel列", disabled=True, width="small"),
-            "編號": st.column_config.TextColumn("編號", disabled=True, width="small"),
-            "帳號名稱": st.column_config.TextColumn("帳號名稱", disabled=True),
-            "姓名": st.column_config.TextColumn("姓名", disabled=True),
-            "場次": st.column_config.TextColumn("場次", disabled=True),
-            "票數": st.column_config.TextColumn("票數", disabled=True, width="small"),
-            "A欄備註": st.column_config.TextColumn("A欄備註", disabled=True),
-            "待處理原因": st.column_config.TextColumn("待處理原因", disabled=True, width="large"),
-            "本次處理": st.column_config.SelectboxColumn(
-                "本次處理", options=["待確認", "本次不列印（已核對）"], required=True,
-            ),
-        },
-        hide_index=True, use_container_width=True,
-        height=min(520, 38 * (len(records) + 1) + 3),
-        key=f"incomplete_row_review_{key}_{data_start}",
-    )
-    excluded_rows = {int(row["Excel列"]) for _, row in edited.iterrows()
-                     if row["本次處理"] == "本次不列印（已核對）"}
-    pending_rows = sum(1 for _, row in edited.iterrows() if row["本次處理"] == "待確認")
-    return excluded_rows, pending_rows
 
 def render_note_review_sheets(sheet_names, raw_sheets, data_start, key, required_columns, saved_policy=None, carry_id=False):
     combined_rows = []
@@ -1280,12 +1221,8 @@ def parse_custom_sheet(df, sheet_name, rule):
 
     key_occurrences = defaultdict(int)
     last_complete_context = None
-    excluded_rows = {int(row_number) for row_number in rule.get("excluded_rows", set())}
-    manually_excluded = 0
+    incomplete_rows = []
     for row_idx in range(rule["data_start"], len(df)):
-        if row_idx + 1 in excluded_rows:
-            manually_excluded += 1
-            continue
         row = df.iloc[row_idx]
         row_values = row.tolist()
         def value(field):
@@ -1323,7 +1260,7 @@ def parse_custom_sheet(df, sheet_name, rule):
         if not name or not session or not count_raw:
             if name or session or count_raw or row_id or seat or note:
                 missing = [label for label, val in [("姓名", name), ("場次", session), ("票數", count_raw)] if not val]
-                warnings.append(f"第 {row_idx + 1} 行：缺少{'、'.join(missing)}，已略過。")
+                incomplete_rows.append((row_idx + 1, "、".join(missing)))
             continue
         if rule.get("filter_col") is not None and not value("列印條件"):
             filtered_by_condition += 1
@@ -1400,8 +1337,9 @@ def parse_custom_sheet(df, sheet_name, rule):
     append_no_print_summary(warnings, excluded_notes)
     append_unresolved_note_summary(warnings, unresolved_notes)
     append_rule_exclusion_summary(warnings, "自訂列印條件", filtered_by_condition)
-    if manually_excluded:
-        warnings.append(f"依照本次逐筆確認排除資料：{manually_excluded} 筆。")
+    if incomplete_rows:
+        details = "、".join(f"第 {row_number} 列缺少{missing}" for row_number, missing in incomplete_rows)
+        warnings.append(f"因必要欄位不完整而略過資料：共 {len(incomplete_rows)} 列（{details}）。這些列不會產生標籤。")
     tickets.sort(key=lambda x: x["earliest_sort"])
     return tickets, warnings
 
@@ -1798,22 +1736,16 @@ if st.session_state.page == "upload":
                                  "data_start": int(data_start) - 1,
                                  "filter_col": mapped["列印條件"], "merge_id": merge_id,
                                  "vip_format": vip_format, "note_policy": note_policy}
-            _, base_preview_w = parse_custom_sheet(df, sname, base_preview_rule)
-            issue_columns = dict(mapped)
-            account_col = next((idx for idx, header in enumerate(header_values)
-                                if any(word in re.sub(r"\s+", "", str(header or ""))
-                                       for word in ["帳號名稱", "會員帳號"])), None)
-            issue_columns["帳號名稱"] = account_col
-            excluded_rows, pending_issue_count = render_incomplete_row_review(
-                df, base_preview_w, issue_columns, custom_key, int(data_start) - 1)
-            preview_rule = {**base_preview_rule, "excluded_rows": excluded_rows}
+            preview_rule = base_preview_rule
             preview_t, preview_w = parse_custom_sheet(df, sname, preview_rule)
             custom_blocking_warnings = [w for w in preview_w if has_blocking_warnings([w])]
             if mapped["姓名"] is None or mapped["場次"] is None or mapped["票數"] is None:
                 st.warning("請先指定姓名、場次和票數欄位。")
             else:
                 st.success(f"預覽解析到 {len(preview_t)} 筆有效資料。")
-                other_warnings = [w for w in preview_w if not re.match(r"第 \d+ 行：", str(w))]
+                other_warnings = [w for w in preview_w
+                                  if not re.match(r"第 \d+ 行：", str(w))
+                                  and not str(w).startswith("因必要欄位不完整而略過資料：")]
                 if other_warnings:
                     with st.expander(f"查看 {len(other_warnings)} 項解析摘要"):
                         for warning in other_warnings[:20]: st.write(warning)
@@ -1827,8 +1759,9 @@ if st.session_state.page == "upload":
 
             if note_pending > 0:
                 st.warning(f"尚有 {note_pending} 筆 A 欄備註待確認。請在上方「A 欄備註確認」表格，將「待確認」改為「照常判斷」或「排除」。")
-            if pending_issue_count > 0:
-                st.warning(f"還有 {pending_issue_count} 列缺漏資料待處理。請逐列選擇「本次不列印（已核對）」；需要列印的訂單請補齊 Excel 後重新上傳。")
+            incomplete_summary = [w for w in preview_w if str(w).startswith("因必要欄位不完整而略過資料：")]
+            for summary in incomplete_summary:
+                st.info(summary)
             if custom_blocking_warnings:
                 non_row_blockers = [w for w in custom_blocking_warnings if not re.match(r"第 \d+ 行：", str(w))]
                 if non_row_blockers:
@@ -1860,7 +1793,7 @@ if st.session_state.page == "upload":
                         st.error(f"無法儲存格式設定：{e}")
 
             if st.button("✅ 確認設定，前往標籤產生", type="primary", use_container_width=True,
-                         key=f"apply_custom_{custom_key}", disabled=(mapped["姓名"] is None or mapped["場次"] is None or mapped["票數"] is None or len(st.session_state.selected_sheets) != 1 or note_pending > 0 or pending_issue_count > 0 or bool(custom_blocking_warnings))):
+                         key=f"apply_custom_{custom_key}", disabled=(mapped["姓名"] is None or mapped["場次"] is None or mapped["票數"] is None or len(st.session_state.selected_sheets) != 1 or note_pending > 0 or bool(custom_blocking_warnings))):
                 with st.spinner("依照欄位設定解析中..."):
                     all_t, all_w = [], []
                     for sh in st.session_state.selected_sheets:

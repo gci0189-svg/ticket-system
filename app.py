@@ -132,10 +132,31 @@ def get_gc():
         return None
 
 def load_history(sid: str) -> set:
+    try:
+        service_account = st.secrets.get("gcp_service_account")
+    except Exception:
+        service_account = None
+    if service_account is None or not hasattr(service_account, "get"):
+        st.session_state.history_available = False
+        st.session_state.history_error = (
+            "缺少 gcp_service_account 憑證設定。若在本機執行，請設定 .streamlit/secrets.toml；"
+            "若使用部署網站，請在該網站的 Secrets 設定中加入憑證。"
+        )
+        return set()
+    missing_credential_fields = [field for field in ("project_id", "private_key", "client_email", "token_uri")
+                                 if not service_account.get(field)]
+    if missing_credential_fields:
+        st.session_state.history_available = False
+        st.session_state.history_error = "gcp_service_account 憑證缺少必要欄位，請重新設定 Google 服務帳戶憑證。"
+        return set()
+
     gc = get_gc()
     if not gc or not sid:
         st.session_state.history_available = False
-        st.session_state.history_error = "Google Sheets 尚未連線或未設定。"
+        st.session_state.history_error = (
+            "Google 憑證無法載入。請檢查服務帳戶憑證格式與私鑰；"
+            "若憑證正常，請確認歷史試算表 ID。"
+        )
         return set()
     try:
         sh = gc.open_by_key(sid)

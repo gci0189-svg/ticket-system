@@ -6,6 +6,8 @@
 import streamlit as st
 import pandas as pd
 import re
+import json
+import os
 from datetime import datetime
 from io import BytesIO
 from collections import defaultdict
@@ -943,6 +945,72 @@ def group_by_session(tickets: list) -> dict:
     return dict(sorted(grouped.items(), key=lambda x: x[1][0]["earliest_sort"]))
 
 
+TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ticket_field_templates.json")
+
+def load_field_templates():
+    try:
+        with open(TEMPLATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+def save_field_templates(templates):
+    with open(TEMPLATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(templates, f, ensure_ascii=False, indent=2)
+
+def parse_custom_sheet(df, sheet_name, history_set, rule):
+    """Parse a simple row-oriented sheet using user-mapped columns."""
+    tickets, skipped, warnings = [], [], []
+    name_col = rule["columns"].get("姓名")
+    session_col = rule["columns"].get("場次")
+    count_col = rule["columns"].get("票數")
+    if name_col is None or session_col is None or count_col is None:
+        return tickets, skipped, ["必須指定姓名、場次和票數欄位。"]
+
+    key_occurrences = defaultdict(int)
+    for row_idx in range(rule["data_start"], len(df)):
+        row = df.iloc[row_idx]
+        def value(field):
+            col = rule["columns"].get(field)
+            if col is None or col >= len(row): return ""
+            v = row.iloc[col]
+            if pd.isna(v): return ""
+            if isinstance(v, (datetime,)):
+                return v.strftime("%Y/%m/%d %H:%M")
+            return str(v).strip()
+
+        name, session, count_raw = value("姓名"), value("場次"), value("票數")
+        if not name or not session or not count_raw:
+            continue
+        if rule.get("filter_col") is not None and not value("列印條件"):
+            continue
+        count_match = re.search(r"\d+", count_raw.replace(",", ""))
+        if not count_match or int(count_match.group()) <= 0:
+            warnings.append(f"第 {row_idx + 1} 行：票數不是有效的正整數，已略過。")
+            continue
+        count = int(count_match.group())
+        row_id = value("編號")
+        sort_key, display = parse_session(session)
+        seat = value("座位")
+        identity = row_id or "_".join([name, session, seat, str(count)])
+        identity = re.sub(r"\s+", "", identity)
+        occurrence_key = f"{identity}_{sheet_name}"
+        key_occurrences[occurrence_key] += 1
+        key = f"custom_{occurrence_key}_{key_occurrences[occurrence_key]}"
+        entry = {
+            "key": key, "id": row_id, "name": name, "sheet": sheet_name,
+            "total_count": count, "count": count, "earliest_sort": sort_key,
+            "earliest_display": display, "label": f"{display} {name} X {count}",
+            "sns": "", "tel": value("電話"), "seats": [seat] if seat else [],
+            "is_new": key not in history_set, "fmt": "custom",
+        }
+        (tickets if entry["is_new"] else skipped).append(entry)
+    tickets.sort(key=lambda x: x["earliest_sort"])
+    skipped.sort(key=lambda x: x["earliest_sort"])
+    return tickets, skipped, warnings
+
+
 # ══════════════════════════════════════════════════════════
 # Session State
 # ══════════════════════════════════════════════════════════
@@ -959,6 +1027,7 @@ defaults = {
     "checked_keys":        set(),
     "edits":               {},
     "uploaded_file_bytes": None,
+    "field_templates": load_field_templates(),
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -1213,13 +1282,91 @@ if st.session_state.page == "upload":
                 st.session_state.page           = "labels"
                 st.rerun()
         else:
-            st.markdown("""
-            <div class="note-warn">
-            ⚠️ <strong>這張工作表的格式目前尚未設定解析規則。</strong><br><br>
-            請把這份 xlsx 傳給管理員確認格式後更新程式，才能安全產生標籤。<br>
-            <strong>現場取票時間寶貴，絕對不能猜測格式。</strong>
-            </div>
-            """, unsafe_allow_html=True)
+            st.markdown('<div class="note-info">這張表格尚未有內建規則。你可以在下方指定欄位，預覽解析結果，並儲存格式供下次重用。</div>', unsafe_allow_html=True)
+            custom_key = re.sub(r"[^a-zA-Z0-9_]", "_", sname)
+            templates = st.session_state.field_templates
+            saved_names = ["（新設定）"] + list(templates.keys())
+            chosen_template = st.selectbox("套用已儲存的格式", saved_names, key=f"template_select_{custom_key}")
+            template = templates.get(chosen_template, {})
+
+            if chosen_template != "（新設定）":
+                if st.button("📂 載入這套欄位設定", key=f"load_template_{custom_key}"):
+                    st.session_state[f"header_row_{custom_key}"] = int(template.get("header_row", 1))
+                    st.session_state[f"data_start_{custom_key}"] = int(template.get("data_start", 2))
+                    for field in ["姓名", "場次", "座位", "票數", "電話", "編號", "列印條件"]:
+                        idx = template.get("columns", {}).get(field)
+                        st.session_state[f"map_{field}_{custom_key}"] = int(idx) + 1 if isinstance(idx, int) else 0
+                    st.rerun()
+
+            max_rows = max(1, min(len(df), 30))
+            header_row = st.number_input("欄位標題所在列（從 1 開始）", min_value=1,
+                max_value=max_rows, value=int(template.get("header_row", 1)), key=f"header_row_{custom_key}")
+            header_idx = int(header_row) - 1
+            header_values = df.iloc[header_idx].tolist() if header_idx < len(df) else []
+            col_options = ["（不使用）"] + [
+                f"第 {i + 1} 欄｜{str(v).strip()[:35] or '（空白欄）'}" for i, v in enumerate(header_values)
+            ]
+            def saved_col(field):
+                idx = template.get("columns", {}).get(field)
+                return int(idx) + 1 if isinstance(idx, int) and idx < len(header_values) else 0
+            st.caption("請把每個用途對應到 Excel 欄位。姓名、場次、票數為必填；座位、電話、編號和列印條件可不設定。")
+            if len(st.session_state.selected_sheets) != 1:
+                st.warning("自訂欄位設定目前一次處理一張工作表，請先取消其他工作表，避免把不同格式套用同一組欄位。")
+            field_names = ["姓名", "場次", "座位", "票數", "電話", "編號", "列印條件"]
+            cols = st.columns(2)
+            mapped = {}
+            for i, field in enumerate(field_names):
+                with cols[i % 2]:
+                    selected = st.selectbox(field, col_options, index=saved_col(field), key=f"map_{field}_{custom_key}")
+                mapped[field] = None if selected == "（不使用）" else col_options.index(selected) - 1
+            data_start = st.number_input("資料開始列（從 1 開始）", min_value=1, max_value=max(1, len(df)),
+                value=int(template.get("data_start", max(2, int(header_row) + 1))), key=f"data_start_{custom_key}")
+
+            preview_rule = {"columns": mapped, "data_start": int(data_start) - 1,
+                            "filter_col": mapped["列印條件"]}
+            preview_t, preview_s, preview_w = parse_custom_sheet(df, sname, st.session_state.history_set, preview_rule)
+            if mapped["姓名"] is None or mapped["場次"] is None or mapped["票數"] is None:
+                st.warning("請先指定姓名、場次和票數欄位。")
+            else:
+                st.success(f"預覽解析到 {len(preview_t) + len(preview_s)} 筆有效資料（其中 {len(preview_s)} 筆已在歷史紀錄中）。")
+                if preview_w:
+                    with st.expander(f"查看 {len(preview_w)} 筆解析提醒"):
+                        for warning in preview_w[:20]: st.write(warning)
+                preview_rows = [{"姓名": t["name"], "場次": t["earliest_display"],
+                                 "座位": "、".join(t["seats"]), "票數": t["count"], "電話": t["tel"]}
+                                for t in (preview_t + preview_s)[:10]]
+                st.dataframe(pd.DataFrame(preview_rows), hide_index=True, use_container_width=True)
+
+            b1, b2 = st.columns([2, 1])
+            with b1:
+                template_name = st.text_input("格式名稱（例如：新北會員購票）", value=chosen_template if chosen_template != "（新設定）" else "")
+            with b2:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("💾 儲存格式", key=f"save_template_{custom_key}", use_container_width=True,
+                             disabled=not template_name.strip() or mapped["姓名"] is None or mapped["場次"] is None or mapped["票數"] is None):
+                    templates[template_name.strip()] = {"header_row": int(header_row), "data_start": int(data_start), "columns": mapped}
+                    try:
+                        save_field_templates(templates)
+                        st.session_state.field_templates = templates
+                        st.success(f"已儲存「{template_name.strip()}」，下次可直接套用。")
+                    except OSError as e:
+                        st.error(f"無法儲存格式設定：{e}")
+
+            if st.button("✅ 確認設定，前往標籤產生", type="primary", use_container_width=True,
+                         key=f"apply_custom_{custom_key}", disabled=(mapped["姓名"] is None or mapped["場次"] is None or mapped["票數"] is None or len(st.session_state.selected_sheets) != 1)):
+                with st.spinner("依照欄位設定解析中..."):
+                    all_t, all_s, all_w = [], [], []
+                    for sh in st.session_state.selected_sheets:
+                        t, s, w = parse_custom_sheet(st.session_state.raw_sheets[sh], sh,
+                                                     st.session_state.history_set, preview_rule)
+                        all_t.extend(t); all_s.extend(s); all_w.extend(w)
+                st.session_state.tickets = all_t
+                st.session_state.skipped = all_s
+                st.session_state.warnings = all_w
+                st.session_state.rule_confirmed = True
+                st.session_state.checked_keys = set()
+                st.session_state.page = "labels"
+                st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
 
 

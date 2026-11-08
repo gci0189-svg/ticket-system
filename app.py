@@ -1707,6 +1707,7 @@ if st.session_state.page == "upload":
                             "vip_format": vip_format,
                             "note_policy": note_policy}
             preview_t, preview_w = parse_custom_sheet(df, sname, preview_rule)
+            custom_blocking_warnings = [w for w in preview_w if has_blocking_warnings([w])]
             if mapped["姓名"] is None or mapped["場次"] is None or mapped["票數"] is None:
                 st.warning("請先指定姓名、場次和票數欄位。")
             else:
@@ -1721,6 +1722,15 @@ if st.session_state.page == "upload":
                 if st.button("🔄 重新解析並預覽", key=f"reparse_preview_{custom_key}", use_container_width=True):
                     fresh_t, fresh_w = parse_custom_sheet(df, sname, preview_rule)
                     show_ticket_preview_dialog(fresh_t, fresh_w)
+
+            if note_pending > 0:
+                st.warning(f"尚有 {note_pending} 筆 A 欄備註待確認。請在上方「A 欄備註確認」表格，將「待確認」改為「照常判斷」或「排除」。")
+            if custom_blocking_warnings:
+                with st.expander(f"確認設定前需處理 {len(custom_blocking_warnings)} 項解析提醒", expanded=True):
+                    for warning in custom_blocking_warnings[:20]:
+                        st.write(f"• {warning}")
+            if len(st.session_state.selected_sheets) != 1:
+                st.warning("自訂格式目前一次只能處理一張工作表，請在上方只保留一張。")
 
             b1, b2 = st.columns([2, 1])
             with b1:
@@ -1744,7 +1754,7 @@ if st.session_state.page == "upload":
                         st.error(f"無法儲存格式設定：{e}")
 
             if st.button("✅ 確認設定，前往標籤產生", type="primary", use_container_width=True,
-                         key=f"apply_custom_{custom_key}", disabled=(mapped["姓名"] is None or mapped["場次"] is None or mapped["票數"] is None or len(st.session_state.selected_sheets) != 1 or note_pending > 0 or has_blocking_warnings(preview_w))):
+                         key=f"apply_custom_{custom_key}", disabled=(mapped["姓名"] is None or mapped["場次"] is None or mapped["票數"] is None or len(st.session_state.selected_sheets) != 1 or note_pending > 0 or bool(custom_blocking_warnings))):
                 with st.spinner("依照欄位設定解析中..."):
                     all_t, all_w = [], []
                     for sh in st.session_state.selected_sheets:

@@ -132,7 +132,6 @@ def get_gc():
         return None
 
 def load_history(sid: str) -> set:
-    st.session_state.allow_without_history = False
     gc = get_gc()
     if not gc or not sid:
         st.session_state.history_available = False
@@ -185,7 +184,6 @@ def save_history(sid: str, keys: list, labels: list) -> bool:
     except Exception as e:
         st.session_state.history_available = False
         st.session_state.history_error = str(e)
-        st.session_state.allow_without_history = False
         st.error(f"儲存失敗：{e}")
         return False
 
@@ -500,14 +498,29 @@ def parse_session(raw: str):
         m = re.search(r'(\d{1,2})[/／\-月](\d{1,2})', raw)
         month = int(m.group(1)) if m else 99
         day   = int(m.group(2)) if m else 99
-    if any(x in raw for x in ["14:30","15:00","下午","PM","pm"]):
-        sess_str, sess_ord = "下午", 1
-    elif any(x in raw for x in ["10:30","10:00","上午","AM","am"]):
-        sess_str, sess_ord = "上午", 0
+    time_match = re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)", raw)
+    if time_match:
+        hour, minute = int(time_match.group(1)), int(time_match.group(2))
+        if hour < 12 and any(x in raw for x in ["PM", "pm", "下午"]):
+            hour += 12
+        elif hour == 12 and any(x in raw for x in ["AM", "am", "上午"]):
+            hour = 0
+        sess_str = f"{hour:02d}:{minute:02d}"
+        sess_ord = hour * 60 + minute
+    elif any(x in raw for x in ["下午", "PM", "pm"]):
+        sess_str, sess_ord = "下午", 12 * 60
+    elif any(x in raw for x in ["上午", "AM", "am"]):
+        sess_str, sess_ord = "上午", 8 * 60
     else:
         sess_str, sess_ord = "", 0
     display = f"{month}/{day} {sess_str}".strip()
     return (month, day, sess_ord), display
+
+def session_time_missing(raw, display):
+    if not display or display.startswith("99/99"):
+        return True
+    return not re.search(r"\d{1,2}:\d{2}", str(raw)) and not any(
+        marker in str(raw) for marker in ["上午", "下午", "AM", "am", "PM", "pm"])
 
 
 
@@ -528,6 +541,140 @@ def parse_session(raw: str):
 # 唯一識別碼：{編號}_{工作表名稱}
 # ══════════════════════════════════════════════════════════
 
+NO_PRINT_NOTE_MARKERS = ("退票", "已拿票", "郵遞", "郵寄", "已印票")
+
+def get_note_text(row):
+    note_value = row[0] if len(row) else ""
+    note = "" if note_value is None or pd.isna(note_value) else str(note_value).strip()
+    if re.fullmatch(r"\d+(?:\.0+)?", note):
+        return ""
+    return note
+
+def has_data_outside_a(row):
+    return any(not pd.isna(value) and str(value).strip() for value in row[1:])
+
+def no_print_note_reason(row):
+    """Return a known no-print status found in column A, if any."""
+    note = get_note_text(row)
+    for marker in NO_PRINT_NOTE_MARKERS:
+        position = note.find(marker)
+        if position < 0:
+            continue
+        prefix = note[max(0, position - 2):position]
+        if re.search(r"(?:未|尚未|非|待)$", prefix):
+            continue
+        return marker
+    return ""
+
+def note_decision(row, note_policy=None):
+    note = get_note_text(row)
+    if not note:
+        return "繼續", ""
+    if note_policy is not None and note in note_policy:
+        decision = note_policy[note]
+        if decision == "排除":
+            return "排除", no_print_note_reason(row) or note
+        if decision == "照常判斷":
+            return "繼續", ""
+        return "待確認", note
+    reason = no_print_note_reason(row)
+    return ("排除", reason) if reason else ("待確認", note)
+
+def append_no_print_summary(warnings, excluded_notes):
+    if excluded_notes:
+        details = "、".join(f"{reason} {count} 筆" for reason, count in excluded_notes.items())
+        warnings.append(f"已依 A 欄備註排除不需列印資料：{details}。")
+
+def append_unresolved_note_summary(warnings, unresolved_notes):
+    if unresolved_notes:
+        details = "、".join(f"「{note}」{count} 筆" for note, count in unresolved_notes.items())
+        warnings.append(f"A 欄有尚未確認的備註：{details}。請先選擇列印或排除。")
+
+def append_rule_exclusion_summary(warnings, reason, count):
+    if count:
+        warnings.append(f"依照「{reason}」排除 {count} 筆資料。")
+
+def has_blocking_warnings(warnings):
+    informational_prefixes = (
+        "已依 A 欄備註排除不需列印資料：",
+        "依照「現場取票欄」排除",
+        "依照「自訂列印條件」排除",
+    )
+    return any(not str(w).startswith(informational_prefixes) for w in warnings)
+
+def apply_parsed_result(tickets, skipped, warnings):
+    if has_blocking_warnings(warnings):
+        st.error("解析結果有未確認或不完整資料，已暫停產生標籤。請先修正欄位或確認備註。")
+        with st.expander(f"查看 {len(warnings)} 筆解析提醒"):
+            for warning in warnings:
+                st.write(warning)
+        return
+    st.session_state.tickets = tickets
+    st.session_state.skipped = skipped
+    st.session_state.warnings = warnings
+    st.session_state.rule_confirmed = True
+    st.session_state.checked_keys = set()
+    st.session_state.page = "labels"
+    st.rerun()
+
+def render_note_review(df, data_start, key, saved_policy=None):
+    note_counts = defaultdict(int)
+    for row_idx in range(data_start, len(df)):
+        row = df.iloc[row_idx].tolist()
+        note = get_note_text(row)
+        if note and any(not pd.isna(value) and str(value).strip() for value in row[1:]):
+            note_counts[note] += 1
+    if not note_counts:
+        return {}, 0
+
+    st.markdown("**A 欄備註確認**")
+    st.caption("已知的退票、已拿票、郵遞／郵寄、已印票會預設排除；其他備註需先選擇處理方式，未確認前不能產生標籤。")
+    rows = []
+    saved_policy = saved_policy or {}
+    for note, count in note_counts.items():
+        known = no_print_note_reason([note])
+        default_decision = saved_policy.get(note)
+        if default_decision not in ("待確認", "照常判斷", "排除"):
+            default_decision = "排除" if known else "待確認"
+        rows.append({"A 欄備註": note, "筆數": count, "處理方式": default_decision})
+    note_df = pd.DataFrame(rows)
+    edited = st.data_editor(
+        note_df,
+        column_config={
+            "A 欄備註": st.column_config.TextColumn("A 欄備註", disabled=True),
+            "筆數": st.column_config.NumberColumn("筆數", disabled=True, width="small"),
+            "處理方式": st.column_config.SelectboxColumn(
+                "處理方式", options=["待確認", "照常判斷", "排除"], required=True,
+            ),
+        },
+        hide_index=True, use_container_width=True,
+        key=f"note_review_{key}_{data_start}",
+    )
+    policy = {str(r["A 欄備註"]): str(r["處理方式"]) for _, r in edited.iterrows()}
+    unresolved = sum(int(r["筆數"]) for _, r in edited.iterrows() if r["處理方式"] == "待確認")
+    return policy, unresolved
+
+def render_note_review_sheets(sheet_names, raw_sheets, data_start, key, saved_policy=None):
+    combined_rows = []
+    for sheet_name in sheet_names:
+        df = raw_sheets[sheet_name]
+        combined_rows.extend(df.iloc[data_start:].values.tolist())
+    return render_note_review(pd.DataFrame(combined_rows), 0, key, saved_policy)
+
+def parse_sheet_group(sheet_names, raw_sheets, history_set, parser, note_policy=None):
+    tickets, skipped, warnings = [], [], []
+    for sheet_name in sheet_names:
+        if note_policy is None:
+            t, s, w = parser(raw_sheets[sheet_name], sheet_name, history_set)
+        else:
+            t, s, w = parser(raw_sheets[sheet_name], sheet_name, history_set, note_policy)
+        tickets.extend(t)
+        skipped.extend(s)
+        warnings.extend(w)
+    tickets.sort(key=lambda x: (x["earliest_sort"], ticket_id_sort(x)))
+    skipped.sort(key=lambda x: (x["earliest_sort"], ticket_id_sort(x)))
+    return tickets, skipped, warnings
+
 def parse_label_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
     """
     解析貴賓印製標籤版 / 社福印製標籤版。
@@ -536,6 +683,7 @@ def parse_label_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
     rows = df.values.tolist()
     results  = []
     warnings = []
+    excluded_notes = defaultdict(int)
 
     # 判斷是貴賓（有座位欄）還是社福（無座位欄）
     row1_str = " ".join(str(c) for c in rows[1]) if len(rows) > 1 else ""
@@ -549,6 +697,10 @@ def parse_label_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
 
     for i, row in enumerate(rows):
         if i < 2: continue  # 跳過劇名列和標題列
+        note_reason = no_print_note_reason(row)
+        if note_reason and has_data_outside_a(row):
+            excluded_notes[note_reason] += 1
+            continue
 
         def get(idx):
             if idx >= len(row): return ""
@@ -563,14 +715,23 @@ def parse_label_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
         count_raw = get(COL_COUNT)
 
         if not row_id or not name or not count_raw:
+            if row_id or name or date_raw or count_raw:
+                missing = [label for label, value in [("編號", row_id), ("姓名", name), ("票數", count_raw)] if not value]
+                warnings.append(f"第 {i + 1} 行：缺少{'、'.join(missing)}，已暫停列印確認。")
             continue
 
         count_clean = re.sub(r"[^0-9]", "", count_raw)
-        if not count_clean: continue
+        if not count_clean:
+            warnings.append(f"第 {i + 1} 行：票數「{count_raw}」無法解析。")
+            continue
         count = int(count_clean)
-        if count <= 0: continue
+        if count <= 0:
+            warnings.append(f"第 {i + 1} 行：票數必須大於 0。")
+            continue
 
         sort_key, display = parse_session(date_raw)
+        if session_time_missing(date_raw, display):
+            warnings.append(f"第 {i + 1} 行：場次日期／時間無法辨識，請先修正。")
         key = f"{row_id}_{sheet_name}"
         label = f"{display} {name} X {count}"
 
@@ -597,6 +758,8 @@ def parse_label_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
             entry_copy = dict(entry)
             results.append(entry_copy)
 
+    append_no_print_summary(warnings, excluded_notes)
+
     # 分開 new / skipped
     tickets = [r for r in results if r["is_new"]]
     skipped = [r for r in results if not r["is_new"]]
@@ -604,7 +767,7 @@ def parse_label_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
     skipped.sort(key=lambda x: (x["earliest_sort"], ticket_id_sort(x)))
     return tickets, skipped, warnings
 
-def parse_member_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
+def parse_member_sheet(df: pd.DataFrame, sheet_name: str, history_set: set, note_policy=None):
     """
     解析 LINE 會員格式工作表。
     回傳 (tickets, skipped, warnings)
@@ -626,6 +789,8 @@ def parse_member_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
 
     merged   = {}   # unique_key → dict
     warnings = []
+    excluded_notes = defaultdict(int)
+    unresolved_notes = defaultdict(int)
     last_id  = None  # 追蹤最近一個有效編號
 
     for i, row in enumerate(rows):
@@ -636,13 +801,20 @@ def parse_member_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
         count_raw = get(row, COL_COUNT)
         price     = get(row, COL_PRICE)
 
-        # 跳過 A欄有「已印票」標記的列
-        a_val = str(row[0] or "").strip() if len(row) > 0 else ""
-        if "已印票" in a_val:
+        note_action, note_reason = note_decision(row, note_policy) if has_data_outside_a(row) else ("繼續", "")
+        if note_action == "排除":
+            excluded_notes[note_reason] += 1
+            continue
+        if note_action == "待確認":
+            unresolved_notes[note_reason] += 1
             continue
 
         # 列印條件：三欄都要有值
         if not seat or not count_raw or not price:
+            row_has_ticket_data = any(get(row, col) for col in [COL_ID, COL_NAME, COL_DATE, COL_SEAT, COL_COUNT, COL_PRICE])
+            if row_has_ticket_data:
+                missing = [label for label, value in [("座位", seat), ("張數", count_raw), ("票價", price)] if not value]
+                warnings.append(f"第 {i + 1} 行：缺少{'、'.join(missing)}，未列印並需人工核對。")
             continue
 
         # 張數解析
@@ -652,10 +824,12 @@ def parse_member_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
             continue
         count = int(count_clean)
         if count <= 0:
+            warnings.append(f"第 {i + 1} 行：張數必須大於 0。")
             continue
 
         # 票價必須像數字
         if not re.search(r'\d', price):
+            warnings.append(f"第 {i + 1} 行：票價「{price}」無法辨識。")
             continue
 
         row_id   = get(row, COL_ID)
@@ -673,6 +847,8 @@ def parse_member_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
 
         key = f"{last_id}_{sheet_name}"
         sort_key, display = parse_session(date_raw)
+        if session_time_missing(date_raw, display):
+            warnings.append(f"第 {i + 1} 行：場次日期／時間無法辨識，請先修正。")
 
         if key not in merged:
             # C欄（社群帳號）若含「樓」「排」表示誤填了座位資訊，視為空白
@@ -723,6 +899,9 @@ def parse_member_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
         else:
             skipped.append(entry)
 
+    append_no_print_summary(warnings, excluded_notes)
+    append_unresolved_note_summary(warnings, unresolved_notes)
+
     tickets.sort(key=lambda x: x["earliest_sort"])
     skipped.sort(key=lambda x: x["earliest_sort"])
     return tickets, skipped, warnings
@@ -738,9 +917,12 @@ def parse_member_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
 # 列印條件：col22 非空（現場取票）
 # 合併：相同編號 → 各場次張數加總、取最早場次（方案A）
 # ══════════════════════════════════════════════════════════
-def parse_taibei_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
+def parse_taibei_sheet(df: pd.DataFrame, sheet_name: str, history_set: set, note_policy=None):
     rows = df.values.tolist()
     warnings_list = []
+    excluded_notes = defaultdict(int)
+    unresolved_notes = defaultdict(int)
+    non_pickup_skipped = 0
 
     COL_ID     = 1
     COL_SNS    = 5
@@ -772,10 +954,19 @@ def parse_taibei_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
 
     for i, row in enumerate(rows):
         if i < 2: continue
+        note_action, note_reason = note_decision(row, note_policy) if has_data_outside_a(row) else ("繼續", "")
+        if note_action == "排除":
+            excluded_notes[note_reason] += 1
+            continue
+        if note_action == "待確認":
+            unresolved_notes[note_reason] += 1
+            continue
 
         # 現場取票欄
         pickup = get_val(row, COL_PICKUP).upper()
         if not pickup:
+            if any(get_val(row, col) for col in [COL_ID, COL_NAME, COL_SEAT, *range(11, 16)]):
+                non_pickup_skipped += 1
             continue  # 空白代表不需現場取票
 
         row_id_raw = get_val(row, COL_ID)
@@ -793,6 +984,7 @@ def parse_taibei_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
         total = 0
         earliest_sort   = (99, 99, 99)
         earliest_display = ""
+        earliest_source = ""
         for ci, sess_label in session_cols:
             val = get_val(row, ci)
             count_clean = re.sub(r"[^0-9]", "", val)
@@ -804,6 +996,7 @@ def parse_taibei_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
             if sort_key < earliest_sort:
                 earliest_sort    = sort_key
                 earliest_display = disp
+                earliest_source = sess_label
             total += count
 
         # 若場次欄都沒值，嘗試從主日期 + 張數欄讀
@@ -813,12 +1006,19 @@ def parse_taibei_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
                 v = get_val(row, ci)
                 c = re.sub(r"[^0-9]", "", v)
                 if c: total += int(c)
-            if total == 0: continue
+            if total == 0:
+                warnings_list.append(f"第 {i + 1} 行：標記現場取票，但沒有可確認的票數。")
+                continue
             if not earliest_display:
                 earliest_sort, earliest_display = parse_session(date_raw)
+                earliest_source = date_raw
 
         if not earliest_display:
             earliest_sort, earliest_display = parse_session(date_raw)
+            earliest_source = date_raw
+        if session_time_missing(earliest_source, earliest_display):
+            warnings_list.append(f"第 {i + 1} 行：場次日期／時間無法辨識，請先修正。")
+            continue
 
         key = f"{last_id}_{sheet_name}"
         if key not in merged:
@@ -842,6 +1042,10 @@ def parse_taibei_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
                 merged[key]["seats"].append(seat)
 
         merged[key]["total_count"] += total
+
+    append_rule_exclusion_summary(warnings_list, "現場取票欄", non_pickup_skipped)
+    append_no_print_summary(warnings_list, excluded_notes)
+    append_unresolved_note_summary(warnings_list, unresolved_notes)
 
     tickets, skipped = [], []
     for key, info in merged.items():
@@ -869,9 +1073,12 @@ def parse_taibei_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
 # 唯一識別碼：{姓名}_{場次}_{工作表名稱}
 # 標籤：{場次} 貴賓｜{公司}｜{姓名} X {張數}
 # ══════════════════════════════════════════════════════════
-def parse_other_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
+def parse_other_sheet(df: pd.DataFrame, sheet_name: str, history_set: set, note_policy=None):
     rows = df.values.tolist()
     warnings_list = []
+    excluded_notes = defaultdict(int)
+    unresolved_notes = defaultdict(int)
+    non_pickup_skipped = 0
 
     COL_COMPANY = 5
     COL_NAME    = 6
@@ -898,6 +1105,13 @@ def parse_other_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
 
     for i, row in enumerate(rows):
         if i < 2: continue
+        note_action, note_reason = note_decision(row, note_policy) if has_data_outside_a(row) else ("繼續", "")
+        if note_action == "排除":
+            excluded_notes[note_reason] += 1
+            continue
+        if note_action == "待確認":
+            unresolved_notes[note_reason] += 1
+            continue
 
         # 跳過群組標題列（A欄有「貴賓」「社福」等）
         a_val = get_val(row, 0)
@@ -906,7 +1120,10 @@ def parse_other_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
 
         # 現場取票
         pickup = get_val(row, COL_PICKUP)
-        if not pickup: continue
+        if not pickup:
+            if any(get_val(row, col) for col in [COL_NAME, COL_SEAT, *SESSION_COLS]):
+                non_pickup_skipped += 1
+            continue
 
         name    = get_val(row, COL_NAME)
         company = get_val(row, COL_COMPANY)
@@ -914,21 +1131,29 @@ def parse_other_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
         seat    = get_val(row, COL_SEAT)
         date_raw = get_val(row, COL_DATE)
 
-        if not name: continue
+        if not name:
+            warnings_list.append(f"第 {i + 1} 行：標記現場取票但缺少姓名。")
+            continue
 
         # 每個有值的場次欄各產生一筆（但同場次合併）
+        row_had_session_count = False
         for ci in SESSION_COLS:
             val = get_val(row, ci)
             count_clean = re.sub(r"[^0-9]", "", val)
             if not count_clean: continue
             count = int(count_clean)
             if count <= 0: continue
+            row_had_session_count = True
 
             # 場次：優先用欄標題，fallback 用主日期
             sess_raw = sess_labels.get(ci, "")
             sort_key, display = parse_session(sess_raw)
             if display == "99/99":
                 sort_key, display = parse_session(date_raw)
+                sess_raw = date_raw
+            if session_time_missing(sess_raw, display):
+                warnings_list.append(f"第 {i + 1} 行：場次日期／時間無法辨識，請先修正。")
+                continue
 
             # key：姓名+場次+工作表
             safe = re.sub(r"\s", "", f"{name}_{display}_{sheet_name}")
@@ -948,6 +1173,12 @@ def parse_other_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
             if entry["is_new"]: tickets.append(entry)
             else: skipped.append(entry)
 
+        if not row_had_session_count:
+            warnings_list.append(f"第 {i + 1} 行：標記現場取票，但沒有任何場次票數。")
+
+    append_rule_exclusion_summary(warnings_list, "現場取票欄", non_pickup_skipped)
+    append_no_print_summary(warnings_list, excluded_notes)
+    append_unresolved_note_summary(warnings_list, unresolved_notes)
     tickets.sort(key=lambda x: x["earliest_sort"])
     skipped.sort(key=lambda x: x["earliest_sort"])
     return tickets, skipped, warnings_list
@@ -1021,6 +1252,9 @@ def parse_custom_sheet(df, sheet_name, history_set, rule):
     """Parse a simple row-oriented sheet using user-mapped columns."""
     tickets, skipped, warnings = [], [], []
     merged = {}
+    excluded_notes = defaultdict(int)
+    unresolved_notes = defaultdict(int)
+    filtered_by_condition = 0
     name_col = rule["columns"].get("姓名")
     session_col = rule["columns"].get("場次")
     count_col = rule["columns"].get("票數")
@@ -1030,6 +1264,14 @@ def parse_custom_sheet(df, sheet_name, history_set, rule):
     key_occurrences = defaultdict(int)
     for row_idx in range(rule["data_start"], len(df)):
         row = df.iloc[row_idx]
+        row_values = row.tolist()
+        note_action, note_reason = note_decision(row_values, rule.get("note_policy")) if has_data_outside_a(row_values) else ("繼續", "")
+        if note_action == "排除":
+            excluded_notes[note_reason] += 1
+            continue
+        if note_action == "待確認":
+            unresolved_notes[note_reason] += 1
+            continue
         def value(field):
             col = rule["columns"].get(field)
             if col is None or col >= len(row): return ""
@@ -1041,11 +1283,12 @@ def parse_custom_sheet(df, sheet_name, history_set, rule):
 
         name, session, count_raw = value("姓名"), value("場次"), value("票數")
         if not name or not session or not count_raw:
-            if sum(bool(v) for v in (name, session, count_raw)) >= 2 or name or session:
+            if name or session or count_raw:
                 missing = [label for label, val in [("姓名", name), ("場次", session), ("票數", count_raw)] if not val]
                 warnings.append(f"第 {row_idx + 1} 行：缺少{'、'.join(missing)}，已略過。")
             continue
         if rule.get("filter_col") is not None and not value("列印條件"):
+            filtered_by_condition += 1
             continue
         count_match = re.search(r"\d+", count_raw.replace(",", ""))
         if not count_match or int(count_match.group()) <= 0:
@@ -1055,7 +1298,7 @@ def parse_custom_sheet(df, sheet_name, history_set, rule):
         row_id = value("編號")
         sort_key, display = parse_session(session)
         seat = value("座位")
-        if display == "99/99":
+        if session_time_missing(session, display):
             warnings.append(f"第 {row_idx + 1} 行：無法辨識場次「{session}」，請在預覽中確認。")
         if rule.get("merge_id") and row_id:
             normalized_id = re.sub(r"\s+", "", row_id)
@@ -1084,6 +1327,9 @@ def parse_custom_sheet(df, sheet_name, history_set, rule):
         merged[key] = entry
     for entry in merged.values():
         (tickets if entry["is_new"] else skipped).append(entry)
+    append_no_print_summary(warnings, excluded_notes)
+    append_unresolved_note_summary(warnings, unresolved_notes)
+    append_rule_exclusion_summary(warnings, "自訂列印條件", filtered_by_condition)
     tickets.sort(key=lambda x: x["earliest_sort"])
     skipped.sort(key=lambda x: x["earliest_sort"])
     return tickets, skipped, warnings
@@ -1114,6 +1360,17 @@ def show_ticket_preview_dialog(tickets, skipped, warnings):
     col_c.metric("已列印", len(skipped) if st.session_state.history_available else "無法判斷")
     if not st.session_state.history_available:
         st.warning("列印歷史未連線，因此這裡無法辨識哪些資料已列印。")
+    session_totals = {}
+    for ticket in all_rows:
+        session = ticket.get("earliest_display", "未辨識場次") or "未辨識場次"
+        item = session_totals.setdefault(session, {"records": 0, "quantity": 0, "sort": ticket.get("earliest_sort", (99, 99, 99))})
+        item["records"] += 1
+        item["quantity"] += int(ticket.get("count", 0))
+    if session_totals:
+        st.markdown("**場次數量核對**")
+        session_rows = [{"場次": session, "資料筆數": values["records"], "票數": values["quantity"]}
+                        for session, values in sorted(session_totals.items(), key=lambda item: item[1]["sort"])]
+        st.dataframe(pd.DataFrame(session_rows), hide_index=True, use_container_width=True)
     preview_rows = [{
         "編號": t.get("id", ""), "姓名": t.get("name", ""),
         "場次": t.get("earliest_display", ""), "座位": "、".join(t.get("seats", [])),
@@ -1151,7 +1408,6 @@ defaults = {
     "history_loaded": False,
     "history_available": False,
     "history_error": "",
-    "allow_without_history": False,
     "label_search": "",
 }
 for k, v in defaults.items():
@@ -1235,7 +1491,7 @@ st.markdown(f"""
 if st.session_state.page == "upload":
 
     if not st.session_state.history_available:
-        st.warning(f"列印歷史目前無法連線：{st.session_state.history_error} 在修復前，系統無法可靠判斷哪些資料已列印。若仍要繼續，請先勾選下方確認。")
+        st.error(f"列印歷史目前無法連線：{st.session_state.history_error}。為避免重複列印，修復連線前不能產生標籤。")
         if st.button("🔄 重試列印歷史連線", key="retry_history_upload"):
             st.session_state.history_set = load_history(HISTORY_SHEET_ID)
             st.session_state.history_loaded = True
@@ -1267,15 +1523,11 @@ if st.session_state.page == "upload":
                 st.session_state.warnings        = []
                 st.session_state.checked_keys    = set()
                 st.session_state.edits           = {}
-                st.session_state.allow_without_history = False
                 st.session_state.label_search = ""
             st.markdown(f'<div class="note-ok">✅ 已載入：{uploaded.name}，共 {len(st.session_state.raw_sheets)} 個工作表</div>', unsafe_allow_html=True)
         except Exception as e:
             st.error(f"讀取失敗：{e}")
     st.markdown('</div>', unsafe_allow_html=True)
-
-    if not st.session_state.history_available:
-        st.checkbox("我了解本次無法排除已列印資料，仍要繼續", key="allow_without_history")
 
     if st.session_state.raw_sheets:
         st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -1335,24 +1587,21 @@ if st.session_state.page == "upload":
                              ("排序","依最早場次"), ("輸出","每場次／工作表分組")]:
                     st.markdown(f'<div class="rule-box"><div class="rule-key">{k}</div><div class="rule-val">{v}</div></div>', unsafe_allow_html=True)
 
-            preview_t, preview_s, preview_w = parse_member_sheet(df, sname, st.session_state.history_set)
+            note_review_key = f"member_{st.session_state.uploaded_workbook_hash[:10]}_{'_'.join(st.session_state.selected_sheets)}"
+            note_policy, note_pending = render_note_review_sheets(
+                st.session_state.selected_sheets, st.session_state.raw_sheets, 2, note_review_key)
+            preview_t, preview_s, preview_w = parse_sheet_group(
+                st.session_state.selected_sheets, st.session_state.raw_sheets,
+                st.session_state.history_set, parse_member_sheet, note_policy)
             render_parse_preview(preview_t, preview_s, preview_w, "member")
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("✅ 確認，前往標籤產生", type="primary", use_container_width=True,
-                          disabled=(not st.session_state.history_available and not st.session_state.allow_without_history)):
+                          disabled=(not st.session_state.history_available or note_pending > 0 or has_blocking_warnings(preview_w))):
                 with st.spinner("解析中..."):
-                    all_t, all_s, all_w = [], [], []
-                    for sh in st.session_state.selected_sheets:
-                        t, s, w = parse_member_sheet(st.session_state.raw_sheets[sh], sh, st.session_state.history_set)
-                        all_t.extend(t); all_s.extend(s); all_w.extend(w)
-                    all_t.sort(key=lambda x: (x["earliest_sort"], ticket_id_sort(x)))
-                st.session_state.tickets        = all_t
-                st.session_state.skipped        = all_s
-                st.session_state.warnings       = all_w
-                st.session_state.rule_confirmed = True
-                st.session_state.checked_keys   = set()
-                st.session_state.page           = "labels"
-                st.rerun()
+                    all_t, all_s, all_w = parse_sheet_group(
+                        st.session_state.selected_sheets, st.session_state.raw_sheets,
+                        st.session_state.history_set, parse_member_sheet, note_policy)
+                apply_parsed_result(all_t, all_s, all_w)
 
         elif is_taibei:
             st.markdown('<div class="note-ok">✅ 偵測到：<strong>台北台語格式</strong>（場次橫向展開）</div>', unsafe_allow_html=True)
@@ -1365,21 +1614,21 @@ if st.session_state.page == "upload":
                 for k, v in [("唯一識別碼","編號＋工作表名稱"), ("標籤格式","NO.{編號} {最早場次} 貴賓｜{姓名} X {總張數}"),
                              ("排序","依最早場次"), ("輸出","每場次分組")]:
                     st.markdown(f'<div class="rule-box"><div class="rule-key">{k}</div><div class="rule-val">{v}</div></div>', unsafe_allow_html=True)
-            preview_t, preview_s, preview_w = parse_taibei_sheet(df, sname, st.session_state.history_set)
+            note_review_key = f"taibei_{st.session_state.uploaded_workbook_hash[:10]}_{'_'.join(st.session_state.selected_sheets)}"
+            note_policy, note_pending = render_note_review_sheets(
+                st.session_state.selected_sheets, st.session_state.raw_sheets, 2, note_review_key)
+            preview_t, preview_s, preview_w = parse_sheet_group(
+                st.session_state.selected_sheets, st.session_state.raw_sheets,
+                st.session_state.history_set, parse_taibei_sheet, note_policy)
             render_parse_preview(preview_t, preview_s, preview_w, "taibei")
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("✅ 確認，前往標籤產生", type="primary", use_container_width=True,
-                          disabled=(not st.session_state.history_available and not st.session_state.allow_without_history)):
+                          disabled=(not st.session_state.history_available or note_pending > 0 or has_blocking_warnings(preview_w))):
                 with st.spinner("解析中..."):
-                    all_t, all_s, all_w = [], [], []
-                    for sh in st.session_state.selected_sheets:
-                        t, s, w = parse_taibei_sheet(st.session_state.raw_sheets[sh], sh, st.session_state.history_set)
-                        all_t.extend(t); all_s.extend(s); all_w.extend(w)
-                    all_t.sort(key=lambda x: (x["earliest_sort"], ticket_id_sort(x)))
-                st.session_state.tickets = all_t; st.session_state.skipped = all_s
-                st.session_state.warnings = all_w; st.session_state.rule_confirmed = True
-                st.session_state.checked_keys = set(); st.session_state.page = "labels"
-                st.rerun()
+                    all_t, all_s, all_w = parse_sheet_group(
+                        st.session_state.selected_sheets, st.session_state.raw_sheets,
+                        st.session_state.history_set, parse_taibei_sheet, note_policy)
+                apply_parsed_result(all_t, all_s, all_w)
 
         elif is_other:
             st.markdown('<div class="note-ok">✅ 偵測到：<strong>其他需求格式</strong>（宜蘭/台北場貴賓）</div>', unsafe_allow_html=True)
@@ -1392,21 +1641,21 @@ if st.session_state.page == "upload":
                 for k, v in [("唯一識別碼","姓名＋場次＋工作表名稱"), ("標籤格式","{場次} 貴賓｜{公司}｜{姓名} X {張數}"),
                              ("場次欄","col12=宜蘭場貴賓、col13=台北場貴賓、col14=台北場購票"), ("輸出","每場次分組")]:
                     st.markdown(f'<div class="rule-box"><div class="rule-key">{k}</div><div class="rule-val">{v}</div></div>', unsafe_allow_html=True)
-            preview_t, preview_s, preview_w = parse_other_sheet(df, sname, st.session_state.history_set)
+            note_review_key = f"other_{st.session_state.uploaded_workbook_hash[:10]}_{'_'.join(st.session_state.selected_sheets)}"
+            note_policy, note_pending = render_note_review_sheets(
+                st.session_state.selected_sheets, st.session_state.raw_sheets, 2, note_review_key)
+            preview_t, preview_s, preview_w = parse_sheet_group(
+                st.session_state.selected_sheets, st.session_state.raw_sheets,
+                st.session_state.history_set, parse_other_sheet, note_policy)
             render_parse_preview(preview_t, preview_s, preview_w, "other")
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("✅ 確認，前往標籤產生", type="primary", use_container_width=True,
-                          disabled=(not st.session_state.history_available and not st.session_state.allow_without_history)):
+                          disabled=(not st.session_state.history_available or note_pending > 0 or has_blocking_warnings(preview_w))):
                 with st.spinner("解析中..."):
-                    all_t, all_s, all_w = [], [], []
-                    for sh in st.session_state.selected_sheets:
-                        t, s, w = parse_other_sheet(st.session_state.raw_sheets[sh], sh, st.session_state.history_set)
-                        all_t.extend(t); all_s.extend(s); all_w.extend(w)
-                    all_t.sort(key=lambda x: (x["earliest_sort"], ticket_id_sort(x)))
-                st.session_state.tickets = all_t; st.session_state.skipped = all_s
-                st.session_state.warnings = all_w; st.session_state.rule_confirmed = True
-                st.session_state.checked_keys = set(); st.session_state.page = "labels"
-                st.rerun()
+                    all_t, all_s, all_w = parse_sheet_group(
+                        st.session_state.selected_sheets, st.session_state.raw_sheets,
+                        st.session_state.history_set, parse_other_sheet, note_policy)
+                apply_parsed_result(all_t, all_s, all_w)
 
         elif is_label_vip or is_label_welfare:
             fmt_name = "貴賓印製標籤版" if is_label_vip else "社福印製標籤版"
@@ -1421,17 +1670,17 @@ if st.session_state.page == "upload":
                              ("排序","依日期場次"), ("輸出","每場次／工作表分組")]:
                     st.markdown(f'<div class="rule-box"><div class="rule-key">{k}</div><div class="rule-val">{v}</div></div>', unsafe_allow_html=True)
 
-            preview_t, preview_s, preview_w = parse_label_sheet(df, sname, st.session_state.history_set)
+            preview_t, preview_s, preview_w = parse_sheet_group(
+                st.session_state.selected_sheets, st.session_state.raw_sheets,
+                st.session_state.history_set, parse_label_sheet)
             render_parse_preview(preview_t, preview_s, preview_w, "label")
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("✅ 確認，前往標籤產生", type="primary", use_container_width=True,
-                          disabled=(not st.session_state.history_available and not st.session_state.allow_without_history)):
+                          disabled=(not st.session_state.history_available or has_blocking_warnings(preview_w))):
                 with st.spinner("解析中..."):
-                    all_t, all_s, all_w = [], [], []
-                    for sh in st.session_state.selected_sheets:
-                        t, s, w = parse_label_sheet(st.session_state.raw_sheets[sh], sh, st.session_state.history_set)
-                        all_t.extend(t); all_s.extend(s); all_w.extend(w)
-                    all_t.sort(key=lambda x: (x["earliest_sort"], ticket_id_sort(x)))
+                    all_t, all_s, all_w = parse_sheet_group(
+                        st.session_state.selected_sheets, st.session_state.raw_sheets,
+                        st.session_state.history_set, parse_label_sheet)
                 st.session_state.tickets        = all_t
                 st.session_state.skipped        = all_s
                 st.session_state.warnings       = all_w
@@ -1494,9 +1743,12 @@ if st.session_state.page == "upload":
             merge_id = st.checkbox("相同編號、相同場次的多列合併票數與座位",
                 value=bool(template.get("merge_id", mapped["編號"] is not None)),
                 disabled=mapped["編號"] is None, key=f"merge_id_{custom_key}")
+            note_policy, note_pending = render_note_review(
+                df, int(data_start) - 1, custom_key, template.get("note_policy"))
 
             preview_rule = {"columns": mapped, "data_start": int(data_start) - 1,
-                            "filter_col": mapped["列印條件"], "merge_id": merge_id}
+                            "filter_col": mapped["列印條件"], "merge_id": merge_id,
+                            "note_policy": note_policy}
             preview_t, preview_s, preview_w = parse_custom_sheet(df, sname, st.session_state.history_set, preview_rule)
             if mapped["姓名"] is None or mapped["場次"] is None or mapped["票數"] is None:
                 st.warning("請先指定姓名、場次和票數欄位。")
@@ -1527,6 +1779,7 @@ if st.session_state.page == "upload":
                     templates[template_name.strip()] = {
                         "header_row": int(header_row), "data_start": int(data_start),
                         "columns": mapped, "merge_id": merge_id,
+                        "note_policy": note_policy,
                         "header_signature": normalize_headers(header_values),
                     }
                     try:
@@ -1537,20 +1790,14 @@ if st.session_state.page == "upload":
                         st.error(f"無法儲存格式設定：{e}")
 
             if st.button("✅ 確認設定，前往標籤產生", type="primary", use_container_width=True,
-                         key=f"apply_custom_{custom_key}", disabled=(mapped["姓名"] is None or mapped["場次"] is None or mapped["票數"] is None or len(st.session_state.selected_sheets) != 1 or (not st.session_state.history_available and not st.session_state.allow_without_history))):
+                         key=f"apply_custom_{custom_key}", disabled=(mapped["姓名"] is None or mapped["場次"] is None or mapped["票數"] is None or len(st.session_state.selected_sheets) != 1 or not st.session_state.history_available or note_pending > 0 or has_blocking_warnings(preview_w))):
                 with st.spinner("依照欄位設定解析中..."):
                     all_t, all_s, all_w = [], [], []
                     for sh in st.session_state.selected_sheets:
                         t, s, w = parse_custom_sheet(st.session_state.raw_sheets[sh], sh,
                                                      st.session_state.history_set, preview_rule)
                         all_t.extend(t); all_s.extend(s); all_w.extend(w)
-                st.session_state.tickets = all_t
-                st.session_state.skipped = all_s
-                st.session_state.warnings = all_w
-                st.session_state.rule_confirmed = True
-                st.session_state.checked_keys = set()
-                st.session_state.page = "labels"
-                st.rerun()
+                apply_parsed_result(all_t, all_s, all_w)
         st.markdown('</div>', unsafe_allow_html=True)
 
 
@@ -1875,7 +2122,6 @@ elif st.session_state.page == "settings":
                       "uploaded_workbook_hash","label_search"]:
                 st.session_state[k] = defaults[k]
             st.session_state.upload_widget_version += 1
-            st.session_state.allow_without_history = False
             st.success("已清除，請重新上傳")
             st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)

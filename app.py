@@ -438,7 +438,7 @@ def session_time_missing(raw, display):
 # 唯一識別碼：{編號}_{工作表名稱}
 # ══════════════════════════════════════════════════════════
 
-NO_PRINT_NOTE_MARKERS = ("退票", "已拿票", "郵遞", "郵寄", "已印票")
+NO_PRINT_NOTE_MARKERS = ("退票", "取消", "已拿票", "郵遞", "郵寄", "已印票")
 PRINT_CHANGE_NOTE_MARKERS = (
     "換位", "換座", "換日期", "改日期", "換場", "改場",
     "加一張", "追加一張", "少一張", "退一張", "加票", "減票",
@@ -569,7 +569,7 @@ def render_note_review(df, data_start, key, saved_policy=None, required_columns=
         return {}, 0
 
     st.markdown("**A 欄備註確認**")
-    st.caption("退票、已拿票、郵遞／郵寄、已印票會預設排除；換位、換日期、加票、減票會照常列印。其他備註請人工選擇，備註不會自動更改場次或票數。")
+    st.caption("退票、取消、已拿票、郵遞／郵寄、已印票會預設排除；換位、換日期、加票、減票會照常列印。其他備註請人工選擇，備註不會自動更改場次或票數。")
     rows = []
     saved_policy = saved_policy or {}
     for note, count in note_counts.items():
@@ -1216,6 +1216,7 @@ def parse_custom_sheet(df, sheet_name, rule):
         return tickets, ["必須指定姓名、場次和票數欄位。"]
 
     key_occurrences = defaultdict(int)
+    last_complete_context = None
     for row_idx in range(rule["data_start"], len(df)):
         row = df.iloc[row_idx]
         row_values = row.tolist()
@@ -1231,8 +1232,21 @@ def parse_custom_sheet(df, sheet_name, rule):
         name, session, count_raw = value("姓名"), value("場次"), value("票數")
         row_id = value("編號")
         organization = value("單位／稱謂")
+        seat = value("座位")
+        note = get_note_text(row_values)
+        if note and has_data_outside_a(row_values):
+            known_no_print = no_print_note_reason(row_values)
+            if known_no_print:
+                excluded_notes[known_no_print] += 1
+                continue
+
+        # Excel 常用合併儲存格呈現同一訂單的多列座位；續列只有座位與票數時，沿用前一筆完整訂單資料。
+        if (rule.get("merge_id") and last_complete_context and seat and count_raw
+                and not row_id and not name and not session):
+            row_id, name, session = last_complete_context
+
         if not name or not session or not count_raw:
-            if name or session or count_raw:
+            if name or session or count_raw or row_id or seat or note:
                 missing = [label for label, val in [("姓名", name), ("場次", session), ("票數", count_raw)] if not val]
                 warnings.append(f"第 {row_idx + 1} 行：缺少{'、'.join(missing)}，已略過。")
             continue
@@ -1245,7 +1259,8 @@ def parse_custom_sheet(df, sheet_name, rule):
             continue
         count = int(count_match.group())
         sort_key, display = parse_session(session)
-        seat = value("座位")
+        if row_id and name and session:
+            last_complete_context = (row_id, name, session)
         if session_time_missing(session, display):
             warnings.append(f"第 {row_idx + 1} 行：無法辨識場次「{session}」，請在預覽中確認。")
         # A 欄備註只有在四個核對欄位都有效時才套用；缺少編號的備註列先阻擋，避免誤排除或漏印。
@@ -1253,11 +1268,7 @@ def parse_custom_sheet(df, sheet_name, rule):
             note_columns = {"編號": rule["columns"].get("編號"), "姓名": name_col,
                             "場次": session_col, "票數": count_col}
             if not required_fields_valid_for_note(row_values, note_columns):
-                known_no_print = no_print_note_reason(row_values)
                 known_change = any(marker in get_note_text(row_values) for marker in PRINT_CHANGE_NOTE_MARKERS)
-                if known_no_print:
-                    excluded_notes[known_no_print] += 1
-                    continue
                 if not known_change:
                     warnings.append(f"第 {row_idx + 1} 行：A 欄有備註，但編號、姓名、場次、票數未全部有效；請補齊並重新解析。")
                     continue

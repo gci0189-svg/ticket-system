@@ -153,18 +153,63 @@ def load_history(sid: str) -> set:
     try:
         ws = sh.worksheet("已列印紀錄")
     except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet("已列印紀錄", 1000, 3)
-        ws.append_row(["唯一識別碼", "列印時間", "標籤內容"])
+        ws = sh.add_worksheet("已列印紀錄", 1000, 4)
+        ws.append_row(["唯一識別碼", "列印時間", "標籤內容", "資料版本"])
+        st.session_state.history_labels = {}
+        st.session_state.history_versions = {}
         return set()
     try:
-        vals = ws.col_values(1)
-        return {v for v in vals if v and v != "唯一識別碼"}
+        rows = ws.get_all_values()
+        keys = set()
+        labels = {}
+        versions = {}
+        for row in rows[1:]:
+            key = row[0].strip() if row else ""
+            if not key or key == "唯一識別碼":
+                continue
+            keys.add(key)
+            if len(row) > 2 and row[2].strip():
+                labels.setdefault(key, set()).add(normalize_history_label(row[2]))
+            if len(row) > 3 and row[3].strip():
+                versions.setdefault(key, set()).add(row[3].strip())
+        st.session_state.history_labels = labels
+        st.session_state.history_versions = versions
+        return keys
     except Exception as e:
         st.session_state.history_available = False
         st.session_state.history_error = f"讀取歷史紀錄失敗：{e}"
         return set()
 
-def save_history(sid: str, keys: list, labels: list) -> bool:
+def normalize_history_label(label):
+    return re.sub(r"\s+", " ", str(label or "")).strip()
+
+def history_version_signature(label, seats=None):
+    if isinstance(seats, str):
+        seats = re.split(r"[、,;\n\r]+", seats)
+    payload = {
+        "label": normalize_history_label(label),
+        "seats": sorted(re.sub(r"\s+", " ", str(seat or "")).strip() for seat in (seats or []) if str(seat or "").strip()),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+def is_new_label_version(key, label, history_set, seats=None, force_revision=False):
+    """Treat an exact prior label as printed; changed date/name/count needs a new print."""
+    if key not in history_set:
+        return True
+    signature = history_version_signature(label, seats)
+    known_versions = st.session_state.get("history_versions", {}).get(key, set())
+    if known_versions:
+        return signature not in known_versions
+    if force_revision:
+        return True
+    known_labels = st.session_state.get("history_labels", {}).get(key, set())
+    if not known_labels:
+        # Legacy rows without stored label text remain conservatively marked printed.
+        return False
+    return normalize_history_label(label) not in known_labels
+
+def save_history(sid: str, keys: list, labels: list, versions: list) -> bool:
     gc = get_gc()
     if not gc:
         st.error("Google Sheets 連線失敗")
@@ -174,10 +219,14 @@ def save_history(sid: str, keys: list, labels: list) -> bool:
         try:
             ws = sh.worksheet("已列印紀錄")
         except:
-            ws = sh.add_worksheet("已列印紀錄", 1000, 3)
-            ws.append_row(["唯一識別碼", "列印時間", "標籤內容"])
+            ws = sh.add_worksheet("已列印紀錄", 1000, 4)
+            ws.append_row(["唯一識別碼", "列印時間", "標籤內容", "資料版本"])
+        if ws.col_count < 4:
+            ws.add_cols(4 - ws.col_count)
+        if ws.cell(1, 4).value != "資料版本":
+            ws.update_cell(1, 4, "資料版本")
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        ws.append_rows([[k, now, l] for k, l in zip(keys, labels)])
+        ws.append_rows([[k, now, l, v] for k, l, v in zip(keys, labels, versions)])
         st.session_state.history_available = True
         st.session_state.history_error = ""
         return True
@@ -542,6 +591,10 @@ def session_time_missing(raw, display):
 # ══════════════════════════════════════════════════════════
 
 NO_PRINT_NOTE_MARKERS = ("退票", "已拿票", "郵遞", "郵寄", "已印票")
+PRINT_CHANGE_NOTE_MARKERS = (
+    "換位", "換座", "換日期", "改日期", "換場", "改場",
+    "加一張", "追加一張", "少一張", "退一張", "加票", "減票",
+)
 
 def get_note_text(row):
     note_value = row[0] if len(row) else ""
@@ -552,6 +605,27 @@ def get_note_text(row):
 
 def has_data_outside_a(row):
     return any(not pd.isna(value) and str(value).strip() for value in row[1:])
+
+def required_fields_valid_for_note(row, columns, carried_id=""):
+    def cell(idx):
+        if idx is None or idx >= len(row): return ""
+        value = row[idx]
+        return "" if value is None or pd.isna(value) else str(value).strip()
+    row_id = cell(columns.get("編號")) or carried_id
+    name = cell(columns.get("姓名"))
+    session = cell(columns.get("場次"))
+    count_cols = columns.get("票數")
+    if not isinstance(count_cols, (list, tuple)):
+        count_cols = [count_cols]
+    has_count = False
+    for idx in count_cols:
+        if idx is None: continue
+        match = re.search(r"\d+", cell(idx).replace(",", ""))
+        if match and int(match.group()) > 0:
+            has_count = True
+            break
+    _, display = parse_session(session)
+    return bool(row_id and name and session and has_count and not session_time_missing(session, display))
 
 def no_print_note_reason(row):
     """Return a known no-print status found in column A, if any."""
@@ -578,7 +652,20 @@ def note_decision(row, note_policy=None):
             return "繼續", ""
         return "待確認", note
     reason = no_print_note_reason(row)
-    return ("排除", reason) if reason else ("待確認", note)
+    if reason:
+        return "排除", reason
+    if any(marker in note for marker in PRINT_CHANGE_NOTE_MARKERS):
+        return "繼續", ""
+    return "待確認", note
+
+def default_note_decision(note):
+    """Known ticket changes remain printable; only explicit no-print states default to exclusion."""
+    reason = no_print_note_reason([note])
+    if reason:
+        return "排除"
+    if any(marker in str(note) for marker in PRINT_CHANGE_NOTE_MARKERS):
+        return "照常判斷"
+    return "待確認"
 
 def append_no_print_summary(warnings, excluded_notes):
     if excluded_notes:
@@ -617,10 +704,18 @@ def apply_parsed_result(tickets, skipped, warnings):
     st.session_state.page = "labels"
     st.rerun()
 
-def render_note_review(df, data_start, key, saved_policy=None):
+def render_note_review(df, data_start, key, saved_policy=None, required_columns=None, carry_id=False):
     note_counts = defaultdict(int)
+    last_id = ""
     for row_idx in range(data_start, len(df)):
         row = df.iloc[row_idx].tolist()
+        if required_columns:
+            id_idx = required_columns.get("編號")
+            id_value = row[id_idx] if id_idx is not None and id_idx < len(row) else ""
+            if id_value is not None and not pd.isna(id_value) and str(id_value).strip():
+                last_id = str(id_value).strip()
+            if not required_fields_valid_for_note(row, required_columns, last_id if carry_id else ""):
+                continue
         note = get_note_text(row)
         if note and any(not pd.isna(value) and str(value).strip() for value in row[1:]):
             note_counts[note] += 1
@@ -628,14 +723,14 @@ def render_note_review(df, data_start, key, saved_policy=None):
         return {}, 0
 
     st.markdown("**A 欄備註確認**")
-    st.caption("已知的退票、已拿票、郵遞／郵寄、已印票會預設排除；其他備註需先選擇處理方式，未確認前不能產生標籤。")
+    st.caption("退票、已拿票、郵遞／郵寄、已印票會預設排除；換位、換日期、加票、減票會照常列印。其他備註請人工選擇，備註不會自動更改場次或票數。")
     rows = []
     saved_policy = saved_policy or {}
     for note, count in note_counts.items():
-        known = no_print_note_reason([note])
-        default_decision = saved_policy.get(note)
+        known_change = any(marker in note for marker in PRINT_CHANGE_NOTE_MARKERS)
+        default_decision = "照常判斷" if known_change else saved_policy.get(note)
         if default_decision not in ("待確認", "照常判斷", "排除"):
-            default_decision = "排除" if known else "待確認"
+            default_decision = default_note_decision(note)
         rows.append({"A 欄備註": note, "筆數": count, "處理方式": default_decision})
     note_df = pd.DataFrame(rows)
     edited = st.data_editor(
@@ -648,18 +743,19 @@ def render_note_review(df, data_start, key, saved_policy=None):
             ),
         },
         hide_index=True, use_container_width=True,
-        key=f"note_review_{key}_{data_start}",
+        key=f"note_review_v2_{key}_{data_start}",
     )
     policy = {str(r["A 欄備註"]): str(r["處理方式"]) for _, r in edited.iterrows()}
     unresolved = sum(int(r["筆數"]) for _, r in edited.iterrows() if r["處理方式"] == "待確認")
     return policy, unresolved
 
-def render_note_review_sheets(sheet_names, raw_sheets, data_start, key, saved_policy=None):
+def render_note_review_sheets(sheet_names, raw_sheets, data_start, key, required_columns, saved_policy=None, carry_id=False):
     combined_rows = []
     for sheet_name in sheet_names:
         df = raw_sheets[sheet_name]
         combined_rows.extend(df.iloc[data_start:].values.tolist())
-    return render_note_review(pd.DataFrame(combined_rows), 0, key, saved_policy)
+    return render_note_review(pd.DataFrame(combined_rows), 0, key, saved_policy,
+                              required_columns=required_columns, carry_id=carry_id)
 
 def parse_sheet_group(sheet_names, raw_sheets, history_set, parser, note_policy=None):
     tickets, skipped, warnings = [], [], []
@@ -693,6 +789,7 @@ def parse_label_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
     COL_ID    = 0
     COL_DATE  = 1
     COL_NAME  = 2
+    COL_SEAT  = 3 if has_seat_col else None
     COL_COUNT = 4 if has_seat_col else 3
 
     for i, row in enumerate(rows):
@@ -701,6 +798,7 @@ def parse_label_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
         if note_reason and has_data_outside_a(row):
             excluded_notes[note_reason] += 1
             continue
+        change_note = any(marker in get_note_text(row) for marker in PRINT_CHANGE_NOTE_MARKERS)
 
         def get(idx):
             if idx >= len(row): return ""
@@ -713,6 +811,7 @@ def parse_label_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
         name     = get(COL_NAME)
         date_raw = get(COL_DATE)
         count_raw = get(COL_COUNT)
+        seat = get(COL_SEAT) if COL_SEAT is not None else ""
 
         if not row_id or not name or not count_raw:
             if row_id or name or date_raw or count_raw:
@@ -745,10 +844,13 @@ def parse_label_sheet(df: pd.DataFrame, sheet_name: str, history_set: set):
             "earliest_sort":    sort_key,
             "earliest_display": display,
             "label":            label,
+            "label_name":       name,
+            "label_prefix":     f"{display} ",
             "sns":              "",
             "tel":              "",
-            "seats":            [],
-            "is_new":           key not in history_set,
+            "seats":            [seat] if seat else [],
+            "is_new":           is_new_label_version(key, label, history_set, [seat] if seat else [], change_note),
+            "force_revision":   change_note,
             "fmt":              "label",
         }
 
@@ -801,14 +903,6 @@ def parse_member_sheet(df: pd.DataFrame, sheet_name: str, history_set: set, note
         count_raw = get(row, COL_COUNT)
         price     = get(row, COL_PRICE)
 
-        note_action, note_reason = note_decision(row, note_policy) if has_data_outside_a(row) else ("繼續", "")
-        if note_action == "排除":
-            excluded_notes[note_reason] += 1
-            continue
-        if note_action == "待確認":
-            unresolved_notes[note_reason] += 1
-            continue
-
         # 列印條件：三欄都要有值
         if not seat or not count_raw or not price:
             row_has_ticket_data = any(get(row, col) for col in [COL_ID, COL_NAME, COL_DATE, COL_SEAT, COL_COUNT, COL_PRICE])
@@ -835,6 +929,7 @@ def parse_member_sheet(df: pd.DataFrame, sheet_name: str, history_set: set, note
         row_id   = get(row, COL_ID)
         name     = get(row, COL_NAME)
         date_raw = get(row, COL_DATE)
+        change_note = any(marker in get_note_text(row) for marker in PRINT_CHANGE_NOTE_MARKERS)
 
         # 更新 last_id
         id_digits = re.sub(r'[^0-9]', '', row_id)
@@ -845,10 +940,29 @@ def parse_member_sheet(df: pd.DataFrame, sheet_name: str, history_set: set, note
             warnings.append(f"第 {i+1} 行：找不到編號，已略過")
             continue
 
+        if not name:
+            warnings.append(f"第 {i + 1} 行：缺少姓名，請先核對。")
+            continue
+        if not date_raw:
+            warnings.append(f"第 {i + 1} 行：缺少場次，請先核對。")
+            continue
+
         key = f"{last_id}_{sheet_name}"
         sort_key, display = parse_session(date_raw)
         if session_time_missing(date_raw, display):
             warnings.append(f"第 {i + 1} 行：場次日期／時間無法辨識，請先修正。")
+            continue
+
+        if has_data_outside_a(row) and get_note_text(row):
+            if required_fields_valid_for_note(row, {"編號": COL_ID, "姓名": COL_NAME,
+                                                    "場次": COL_DATE, "票數": COL_COUNT}, last_id):
+                note_action, note_reason = note_decision(row, note_policy)
+                if note_action == "排除":
+                    excluded_notes[note_reason] += 1
+                    continue
+                if note_action == "待確認":
+                    unresolved_notes[note_reason] += 1
+                    continue
 
         if key not in merged:
             # C欄（社群帳號）若含「樓」「排」表示誤填了座位資訊，視為空白
@@ -866,6 +980,7 @@ def parse_member_sheet(df: pd.DataFrame, sheet_name: str, history_set: set, note
                 "earliest_sort":    sort_key,
                 "earliest_display": display,
                 "is_new":           key not in history_set,
+                "force_revision":   change_note,
             }
         else:
             # 更新最早場次
@@ -875,6 +990,8 @@ def parse_member_sheet(df: pd.DataFrame, sheet_name: str, history_set: set, note
             # 補姓名（跨行的附屬行可能是空的）
             if (not merged[key]["name"] or merged[key]["name"] == "(未填姓名)") and name:
                 merged[key]["name"] = name
+            if change_note:
+                merged[key]["force_revision"] = True
 
         # 收集座位（同格內換行也分開）
         raw_seat = str(row[7]).strip() if len(row) > 7 and row[7] else ""
@@ -892,9 +1009,13 @@ def parse_member_sheet(df: pd.DataFrame, sheet_name: str, history_set: set, note
         label = (f"NO.{info['id']} {info['earliest_display']} "
                  f"貴賓｜{info['name']} X {info['total_count']}")
         entry = {**info, "label": label, "count": info["total_count"],
+                 "is_new": is_new_label_version(key, label, history_set, info.get("seats", []),
+                                                 info.get("force_revision", False)),
+                 "label_name": info["name"],
+                 "label_prefix": f"NO.{info['id']} {info['earliest_display']} 貴賓｜",
                   "sns": info.get("sns",""), "tel": info.get("tel",""),
                   "seats": info.get("seats",[]), "fmt": "member"}
-        if info["is_new"]:
+        if entry["is_new"]:
             tickets.append(entry)
         else:
             skipped.append(entry)
@@ -954,14 +1075,6 @@ def parse_taibei_sheet(df: pd.DataFrame, sheet_name: str, history_set: set, note
 
     for i, row in enumerate(rows):
         if i < 2: continue
-        note_action, note_reason = note_decision(row, note_policy) if has_data_outside_a(row) else ("繼續", "")
-        if note_action == "排除":
-            excluded_notes[note_reason] += 1
-            continue
-        if note_action == "待確認":
-            unresolved_notes[note_reason] += 1
-            continue
-
         # 現場取票欄
         pickup = get_val(row, COL_PICKUP).upper()
         if not pickup:
@@ -979,6 +1092,7 @@ def parse_taibei_sheet(df: pd.DataFrame, sheet_name: str, history_set: set, note
         tel  = get_val(row, COL_TEL)
         seat = get_val(row, COL_SEAT)
         date_raw = get_val(row, COL_DATE)
+        change_note = any(marker in get_note_text(row) for marker in PRINT_CHANGE_NOTE_MARKERS)
 
         # 遍歷場次欄，累計有值的張數
         total = 0
@@ -1020,6 +1134,20 @@ def parse_taibei_sheet(df: pd.DataFrame, sheet_name: str, history_set: set, note
             warnings_list.append(f"第 {i + 1} 行：場次日期／時間無法辨識，請先修正。")
             continue
 
+        if not name:
+            warnings_list.append(f"第 {i + 1} 行：標記現場取票但缺少姓名。")
+            continue
+        if has_data_outside_a(row) and get_note_text(row):
+            if required_fields_valid_for_note(row, {"編號": COL_ID, "姓名": COL_NAME,
+                                                    "場次": COL_DATE, "票數": [ci for ci, _ in session_cols]}, last_id or ""):
+                note_action, note_reason = note_decision(row, note_policy)
+                if note_action == "排除":
+                    excluded_notes[note_reason] += 1
+                    continue
+                if note_action == "待確認":
+                    unresolved_notes[note_reason] += 1
+                    continue
+
         key = f"{last_id}_{sheet_name}"
         if key not in merged:
             # C欄社群帳號誤填座位防呆
@@ -1031,6 +1159,7 @@ def parse_taibei_sheet(df: pd.DataFrame, sheet_name: str, history_set: set, note
                 "sheet": sheet_name, "total_count": 0,
                 "earliest_sort": earliest_sort, "earliest_display": earliest_display,
                 "is_new": key not in history_set,
+                "force_revision": change_note,
             }
         else:
             if earliest_sort < merged[key]["earliest_sort"]:
@@ -1040,6 +1169,8 @@ def parse_taibei_sheet(df: pd.DataFrame, sheet_name: str, history_set: set, note
                 if name: merged[key]["name"] = name
             if seat and seat not in merged[key]["seats"]:
                 merged[key]["seats"].append(seat)
+            if change_note:
+                merged[key]["force_revision"] = True
 
         merged[key]["total_count"] += total
 
@@ -1052,9 +1183,13 @@ def parse_taibei_sheet(df: pd.DataFrame, sheet_name: str, history_set: set, note
         label = (f"NO.{info['id']} {info['earliest_display']} "
                  f"貴賓｜{info['name']} X {info['total_count']}")
         entry = {**info, "label": label, "count": info["total_count"],
+                 "is_new": is_new_label_version(key, label, history_set, info.get("seats", []),
+                                                 info.get("force_revision", False)),
+                 "label_name": info["name"],
+                 "label_prefix": f"NO.{info['id']} {info['earliest_display']} 貴賓｜",
                  "sns": info.get("sns",""), "tel": info.get("tel",""),
                  "seats": info.get("seats",[]), "fmt": "member"}
-        if info["is_new"]: tickets.append(entry)
+        if entry["is_new"]: tickets.append(entry)
         else: skipped.append(entry)
 
     tickets.sort(key=lambda x: x["earliest_sort"])
@@ -1105,12 +1240,9 @@ def parse_other_sheet(df: pd.DataFrame, sheet_name: str, history_set: set, note_
 
     for i, row in enumerate(rows):
         if i < 2: continue
-        note_action, note_reason = note_decision(row, note_policy) if has_data_outside_a(row) else ("繼續", "")
-        if note_action == "排除":
+        note_reason = no_print_note_reason(row) if has_data_outside_a(row) else ""
+        if note_reason:
             excluded_notes[note_reason] += 1
-            continue
-        if note_action == "待確認":
-            unresolved_notes[note_reason] += 1
             continue
 
         # 跳過群組標題列（A欄有「貴賓」「社福」等）
@@ -1164,11 +1296,14 @@ def parse_other_sheet(df: pd.DataFrame, sheet_name: str, history_set: set, note_
 
             entry = {
                 "key": key, "id": str(i), "name": name,
+                "organization": company, "label_name": label_name,
+                "label_prefix": f"{display} 貴賓｜",
                 "sns": "", "tel": tel, "seats": [seat] if seat else [],
                 "sheet": sheet_name, "total_count": count, "count": count,
                 "earliest_sort": sort_key, "earliest_display": display,
                 "label": label, "fmt": "label",
-                "is_new": key not in history_set,
+                "is_new": is_new_label_version(key, label, history_set, [seat] if seat else [],
+                                                any(marker in get_note_text(row) for marker in PRINT_CHANGE_NOTE_MARKERS)),
             }
             if entry["is_new"]: tickets.append(entry)
             else: skipped.append(entry)
@@ -1241,6 +1376,7 @@ def suggest_header_column(headers, field):
         "電話": ["電話", "手機", "聯絡電話"],
         "編號": ["編號", "訂單編號", "序號", "流水號"],
         "列印條件": ["現場取票", "取票方式", "領票方式", "列印條件"],
+        "單位／稱謂": ["公司", "單位", "機構", "組織", "職稱", "稱謂"],
     }
     for idx, header in enumerate(headers):
         text = re.sub(r"\s+", "", str(header or ""))
@@ -1265,13 +1401,6 @@ def parse_custom_sheet(df, sheet_name, history_set, rule):
     for row_idx in range(rule["data_start"], len(df)):
         row = df.iloc[row_idx]
         row_values = row.tolist()
-        note_action, note_reason = note_decision(row_values, rule.get("note_policy")) if has_data_outside_a(row_values) else ("繼續", "")
-        if note_action == "排除":
-            excluded_notes[note_reason] += 1
-            continue
-        if note_action == "待確認":
-            unresolved_notes[note_reason] += 1
-            continue
         def value(field):
             col = rule["columns"].get(field)
             if col is None or col >= len(row): return ""
@@ -1282,6 +1411,8 @@ def parse_custom_sheet(df, sheet_name, history_set, rule):
             return str(v).strip()
 
         name, session, count_raw = value("姓名"), value("場次"), value("票數")
+        row_id = value("編號")
+        organization = value("單位／稱謂")
         if not name or not session or not count_raw:
             if name or session or count_raw:
                 missing = [label for label, val in [("姓名", name), ("場次", session), ("票數", count_raw)] if not val]
@@ -1295,11 +1426,32 @@ def parse_custom_sheet(df, sheet_name, history_set, rule):
             warnings.append(f"第 {row_idx + 1} 行：票數不是有效的正整數，已略過。")
             continue
         count = int(count_match.group())
-        row_id = value("編號")
         sort_key, display = parse_session(session)
         seat = value("座位")
         if session_time_missing(session, display):
             warnings.append(f"第 {row_idx + 1} 行：無法辨識場次「{session}」，請在預覽中確認。")
+        # A 欄備註只有在四個核對欄位都有效時才套用；缺少編號的備註列先阻擋，避免誤排除或漏印。
+        if has_data_outside_a(row_values) and get_note_text(row_values):
+            note_columns = {"編號": rule["columns"].get("編號"), "姓名": name_col,
+                            "場次": session_col, "票數": count_col}
+            if not required_fields_valid_for_note(row_values, note_columns):
+                known_no_print = no_print_note_reason(row_values)
+                known_change = any(marker in get_note_text(row_values) for marker in PRINT_CHANGE_NOTE_MARKERS)
+                if known_no_print:
+                    excluded_notes[known_no_print] += 1
+                    continue
+                if not known_change:
+                    warnings.append(f"第 {row_idx + 1} 行：A 欄有備註，但編號、姓名、場次、票數未全部有效；請補齊並重新解析。")
+                    continue
+            else:
+                note_action, note_reason = note_decision(row_values, rule.get("note_policy"))
+                if note_action == "排除":
+                    excluded_notes[note_reason] += 1
+                    continue
+                if note_action == "待確認":
+                    unresolved_notes[note_reason] += 1
+                    continue
+        change_note = any(marker in get_note_text(row_values) for marker in PRINT_CHANGE_NOTE_MARKERS)
         if rule.get("merge_id") and row_id:
             normalized_id = re.sub(r"\s+", "", row_id)
             key = f"custom_{normalized_id}_{sheet_name}_{display}"
@@ -1314,18 +1466,34 @@ def parse_custom_sheet(df, sheet_name, history_set, rule):
                 warnings.append(f"第 {row_idx + 1} 行：編號 {row_id} 對應到不同姓名，請確認是否應合併。")
             merged[key]["count"] += count
             merged[key]["total_count"] += count
+            label_name = f"{organization}｜{name}" if organization else merged[key].get("label_name", name)
+            merged[key]["label_name"] = label_name
+            label_prefix = f"{display} 貴賓｜" if rule.get("vip_format") else f"{display} "
+            merged[key]["label_prefix"] = label_prefix
+            merged[key]["organization"] = organization or merged[key].get("organization", "")
+            merged[key]["label"] = f"{label_prefix}{label_name} X {merged[key]['count']}"
             if seat and seat not in merged[key]["seats"]:
                 merged[key]["seats"].append(seat)
+            if change_note:
+                merged[key]["force_revision"] = True
             continue
+        label_name = f"{organization}｜{name}" if organization else name
         entry = {
             "key": key, "id": row_id or str(row_idx + 1), "name": name, "sheet": sheet_name,
+            "label_name": label_name,
             "total_count": count, "count": count, "earliest_sort": sort_key,
-            "earliest_display": display, "label": f"{display} {name} X {count}",
+            "earliest_display": display,
+            "label": f"{display} {'貴賓｜' if rule.get('vip_format') else ''}{label_name} X {count}",
+            "label_prefix": f"{display} {'貴賓｜' if rule.get('vip_format') else ''}",
+            "organization": organization,
             "sns": "", "tel": value("電話"), "seats": [seat] if seat else [],
-            "is_new": key not in history_set, "fmt": "custom",
+            "force_revision": change_note,
+            "is_new": is_new_label_version(key, f"{display} {'貴賓｜' if rule.get('vip_format') else ''}{label_name} X {count}", history_set, [seat] if seat else []), "fmt": "custom",
         }
         merged[key] = entry
     for entry in merged.values():
+        entry["is_new"] = is_new_label_version(entry["key"], entry["label"], history_set,
+                                                entry.get("seats", []), entry.get("force_revision", False))
         (tickets if entry["is_new"] else skipped).append(entry)
     append_no_print_summary(warnings, excluded_notes)
     append_unresolved_note_summary(warnings, unresolved_notes)
@@ -1340,7 +1508,7 @@ def render_parse_preview(tickets, skipped, warnings, preview_key="default"):
         st.success(f"預覽：找到 {len(all_rows)} 筆資料、共 {sum(int(t.get('count', 0)) for t in all_rows)} 張；其中 {len(skipped)} 筆已列印。")
     else:
         st.info(f"預覽：找到 {len(all_rows)} 筆資料、共 {sum(int(t.get('count', 0)) for t in all_rows)} 張。列印歷史未連線，無法比對已列印項目。")
-    sample = [{"編號": t.get("id", ""), "姓名": t.get("name", ""),
+    sample = [{"標籤內容": t.get("label", ""), "編號": t.get("id", ""), "姓名": t.get("name", ""),
                "場次": t.get("earliest_display", ""), "座位": "、".join(t.get("seats", [])),
                "張數": t.get("count", 0)} for t in all_rows[:8]]
     if sample:
@@ -1372,7 +1540,7 @@ def show_ticket_preview_dialog(tickets, skipped, warnings):
                         for session, values in sorted(session_totals.items(), key=lambda item: item[1]["sort"])]
         st.dataframe(pd.DataFrame(session_rows), hide_index=True, use_container_width=True)
     preview_rows = [{
-        "編號": t.get("id", ""), "姓名": t.get("name", ""),
+        "標籤內容（實際列印）": t.get("label", ""), "編號": t.get("id", ""), "姓名": t.get("name", ""),
         "場次": t.get("earliest_display", ""), "座位": "、".join(t.get("seats", [])),
         "票數": t.get("count", 0), "電話": t.get("tel", ""),
     } for t in all_rows]
@@ -1392,6 +1560,8 @@ defaults = {
     "page":                "upload",
     "history_sid":         HISTORY_SHEET_ID,
     "history_set":         set(),
+    "history_labels":      {},
+    "history_versions":    {},
     "raw_sheets":          {},
     "selected_sheets":     [],
     "rule_confirmed":      False,
@@ -1431,7 +1601,12 @@ def make_current_label(t: dict) -> str:
         if len(parts) == 2:
             return f"{parts[0]}貴賓｜{name} X {count}"
         return f"NO.{t['id']} {t['earliest_display']} 貴賓｜{name} X {count}"
-    return f"{t['earliest_display']} {name} X {count}"
+    organization = t.get("organization", "")
+    label_name = t.get("label_name", t.get("name", ""))
+    if name != t.get("name", ""):
+        label_name = f"{organization}｜{name}" if organization else name
+    label_prefix = t.get("label_prefix", f"{t['earliest_display']} ")
+    return f"{label_prefix}{label_name} X {count}"
 
 
 # ══════════════════════════════════════════════════════════
@@ -1574,8 +1749,17 @@ if st.session_state.page == "upload":
         is_other         = ("社群帳號｜公司" in row0_str and "場地" in row0_str)
         is_label_vip     = ("編號" in row1_str and "日期" in row1_str and "張數" in row1_str and "座位" in row1_str)
         is_label_welfare = ("編號" in row1_str and "日期" in row1_str and "張數" in row1_str and "座位" not in row1_str and "姓名" not in row0_str)
+        manual_only_sheets = [sh for sh in st.session_state.selected_sheets
+                              if "11月親子｜其他票券需求" in sh or "送孩子回劇場" in sh]
 
-        if is_member:
+        if manual_only_sheets:
+            st.warning(
+                "已暫停這些工作表的自動標籤解析：" + "、".join(manual_only_sheets) +
+                "。其中包含多組活動／票數欄，或屬於團體人數與交通安排資料；目前不會套用單一購票列規則，以免漏印或把團體人數當成票數。"
+            )
+            st.info("請先取消選取這些工作表，再處理 LINE 會員或已確認格式的個人購票名單。")
+
+        elif is_member:
             st.markdown('<div class="note-ok">✅ 偵測到：<strong>LINE 會員格式</strong></div>', unsafe_allow_html=True)
             c1, c2 = st.columns(2)
             with c1:
@@ -1589,7 +1773,8 @@ if st.session_state.page == "upload":
 
             note_review_key = f"member_{st.session_state.uploaded_workbook_hash[:10]}_{'_'.join(st.session_state.selected_sheets)}"
             note_policy, note_pending = render_note_review_sheets(
-                st.session_state.selected_sheets, st.session_state.raw_sheets, 2, note_review_key)
+                st.session_state.selected_sheets, st.session_state.raw_sheets, 2, note_review_key,
+                {"編號": 1, "姓名": 3, "場次": 6, "票數": 8}, carry_id=True)
             preview_t, preview_s, preview_w = parse_sheet_group(
                 st.session_state.selected_sheets, st.session_state.raw_sheets,
                 st.session_state.history_set, parse_member_sheet, note_policy)
@@ -1616,7 +1801,8 @@ if st.session_state.page == "upload":
                     st.markdown(f'<div class="rule-box"><div class="rule-key">{k}</div><div class="rule-val">{v}</div></div>', unsafe_allow_html=True)
             note_review_key = f"taibei_{st.session_state.uploaded_workbook_hash[:10]}_{'_'.join(st.session_state.selected_sheets)}"
             note_policy, note_pending = render_note_review_sheets(
-                st.session_state.selected_sheets, st.session_state.raw_sheets, 2, note_review_key)
+                st.session_state.selected_sheets, st.session_state.raw_sheets, 2, note_review_key,
+                {"編號": 1, "姓名": 6, "場次": 9, "票數": [11, 12, 13, 14]}, carry_id=True)
             preview_t, preview_s, preview_w = parse_sheet_group(
                 st.session_state.selected_sheets, st.session_state.raw_sheets,
                 st.session_state.history_set, parse_taibei_sheet, note_policy)
@@ -1641,20 +1827,17 @@ if st.session_state.page == "upload":
                 for k, v in [("唯一識別碼","姓名＋場次＋工作表名稱"), ("標籤格式","{場次} 貴賓｜{公司}｜{姓名} X {張數}"),
                              ("場次欄","col12=宜蘭場貴賓、col13=台北場貴賓、col14=台北場購票"), ("輸出","每場次分組")]:
                     st.markdown(f'<div class="rule-box"><div class="rule-key">{k}</div><div class="rule-val">{v}</div></div>', unsafe_allow_html=True)
-            note_review_key = f"other_{st.session_state.uploaded_workbook_hash[:10]}_{'_'.join(st.session_state.selected_sheets)}"
-            note_policy, note_pending = render_note_review_sheets(
-                st.session_state.selected_sheets, st.session_state.raw_sheets, 2, note_review_key)
             preview_t, preview_s, preview_w = parse_sheet_group(
                 st.session_state.selected_sheets, st.session_state.raw_sheets,
-                st.session_state.history_set, parse_other_sheet, note_policy)
+                st.session_state.history_set, parse_other_sheet)
             render_parse_preview(preview_t, preview_s, preview_w, "other")
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("✅ 確認，前往標籤產生", type="primary", use_container_width=True,
-                          disabled=(not st.session_state.history_available or note_pending > 0 or has_blocking_warnings(preview_w))):
+                          disabled=(not st.session_state.history_available or has_blocking_warnings(preview_w))):
                 with st.spinner("解析中..."):
                     all_t, all_s, all_w = parse_sheet_group(
                         st.session_state.selected_sheets, st.session_state.raw_sheets,
-                        st.session_state.history_set, parse_other_sheet, note_policy)
+                        st.session_state.history_set, parse_other_sheet)
                 apply_parsed_result(all_t, all_s, all_w)
 
         elif is_label_vip or is_label_welfare:
@@ -1706,7 +1889,8 @@ if st.session_state.page == "upload":
                     st.session_state[f"header_row_{custom_key}"] = int(template.get("header_row", 1))
                     st.session_state[f"data_start_{custom_key}"] = int(template.get("data_start", 2))
                     st.session_state[f"merge_id_{custom_key}"] = bool(template.get("merge_id", False))
-                    for field in ["姓名", "場次", "座位", "票數", "電話", "編號", "列印條件"]:
+                    st.session_state[f"vip_format_{custom_key}"] = bool(template.get("vip_format", False))
+                    for field in ["姓名", "場次", "座位", "票數", "電話", "編號", "列印條件", "單位／稱謂"]:
                         idx = template.get("columns", {}).get(field)
                         st.session_state[f"map_{field}_{custom_key}"] = int(idx) + 1 if isinstance(idx, int) and idx < df.shape[1] else 0
                     st.rerun()
@@ -1724,14 +1908,14 @@ if st.session_state.page == "upload":
                 if chosen_template != "（新設定）" and field in template.get("columns", {}):
                     idx = template["columns"].get(field)
                     return int(idx) + 1 if isinstance(idx, int) and idx < len(header_values) else 0
-                if field in ["編號", "姓名", "場次", "票數"]:
+                if field in ["編號", "姓名", "場次", "票數", "單位／稱謂"]:
                     suggested = suggest_header_column(header_values, field)
                     return suggested + 1 if suggested is not None else 0
                 return 0
             st.caption("系統先推薦編號、姓名、場次和票數；其他欄位預設不使用。請核對欄位字母與標題。")
             if len(st.session_state.selected_sheets) != 1:
                 st.warning("自訂欄位設定目前一次處理一張工作表，請先取消其他工作表，避免把不同格式套用同一組欄位。")
-            field_names = ["編號", "姓名", "場次", "票數", "座位", "電話", "列印條件"]
+            field_names = ["編號", "姓名", "場次", "票數", "單位／稱謂", "座位", "電話", "列印條件"]
             cols = st.columns(2)
             mapped = {}
             for i, field in enumerate(field_names):
@@ -1743,11 +1927,17 @@ if st.session_state.page == "upload":
             merge_id = st.checkbox("相同編號、相同場次的多列合併票數與座位",
                 value=bool(template.get("merge_id", mapped["編號"] is not None)),
                 disabled=mapped["編號"] is None, key=f"merge_id_{custom_key}")
+            vip_format = st.checkbox("使用貴賓標籤格式（貴賓｜單位／稱謂｜姓名）",
+                value=bool(template.get("vip_format", mapped["單位／稱謂"] is not None)),
+                key=f"vip_format_{custom_key}")
             note_policy, note_pending = render_note_review(
-                df, int(data_start) - 1, custom_key, template.get("note_policy"))
+                df, int(data_start) - 1, custom_key, template.get("note_policy"),
+                required_columns={"編號": mapped["編號"], "姓名": mapped["姓名"],
+                                  "場次": mapped["場次"], "票數": mapped["票數"]})
 
             preview_rule = {"columns": mapped, "data_start": int(data_start) - 1,
                             "filter_col": mapped["列印條件"], "merge_id": merge_id,
+                            "vip_format": vip_format,
                             "note_policy": note_policy}
             preview_t, preview_s, preview_w = parse_custom_sheet(df, sname, st.session_state.history_set, preview_rule)
             if mapped["姓名"] is None or mapped["場次"] is None or mapped["票數"] is None:
@@ -1760,7 +1950,7 @@ if st.session_state.page == "upload":
                 if preview_w:
                     with st.expander(f"查看 {len(preview_w)} 筆解析提醒"):
                         for warning in preview_w[:20]: st.write(warning)
-                preview_rows = [{"姓名": t["name"], "場次": t["earliest_display"],
+                preview_rows = [{"標籤預覽": t["label"], "姓名": t["name"], "場次": t["earliest_display"],
                                  "座位": "、".join(t["seats"]), "票數": t["count"], "電話": t["tel"]}
                                 for t in (preview_t + preview_s)[:10]]
                 st.dataframe(pd.DataFrame(preview_rows), hide_index=True, use_container_width=True)
@@ -1779,6 +1969,7 @@ if st.session_state.page == "upload":
                     templates[template_name.strip()] = {
                         "header_row": int(header_row), "data_start": int(data_start),
                         "columns": mapped, "merge_id": merge_id,
+                        "vip_format": vip_format,
                         "note_policy": note_policy,
                         "header_signature": normalize_headers(header_values),
                     }
@@ -1848,8 +2039,14 @@ elif st.session_state.page == "labels":
                     to_archive = [t for t in tickets if t["key"] in st.session_state.checked_keys]
                     keys   = [t["key"] for t in to_archive]
                     labels = [make_current_label(t) for t in to_archive]
-                    if save_history(HISTORY_SHEET_ID, keys, labels):
+                    versions = [history_version_signature(
+                        label, st.session_state.edits.get(t["key"], {}).get("seats", t.get("seats", [])))
+                        for t, label in zip(to_archive, labels)]
+                    if save_history(HISTORY_SHEET_ID, keys, labels, versions):
                         st.session_state.history_set.update(keys)
+                        for key, label, version in zip(keys, labels, versions):
+                            st.session_state.history_labels.setdefault(key, set()).add(normalize_history_label(label))
+                            st.session_state.history_versions.setdefault(key, set()).add(version)
                         st.session_state.tickets = [t for t in tickets if t["key"] not in st.session_state.checked_keys]
                         st.session_state.checked_keys = set()
                         st.success(f"✅ 已歸檔 {len(keys)} 筆！")
@@ -2136,6 +2333,8 @@ elif st.session_state.page == "settings":
                 if st.button("↩️", key=f"unarchive_{t['key']}", use_container_width=True, help="取消歸檔，恢復成待列印"):
                     if remove_history(HISTORY_SHEET_ID, [t["key"]]):
                         st.session_state.history_set.discard(t["key"])
+                        st.session_state.history_labels.pop(t["key"], None)
+                        st.session_state.history_versions.pop(t["key"], None)
                         entry = dict(t)
                         entry["is_new"] = True
                         st.session_state.tickets.append(entry)

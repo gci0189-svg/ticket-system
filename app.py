@@ -1905,11 +1905,8 @@ elif st.session_state.page == "labels":
 
                     for sheet_name, group_tickets in sheet_groups.items():
                         import hashlib
-                        safe_id = hashlib.md5(f"{session_display}_{sheet_name}".encode("utf-8")).hexdigest()[:12]
-                        # Include the workbook hash so Streamlit cannot reuse an
-                        # old data_editor state when a new workbook has the same
-                        # sheet/session names.
-                        editor_key = f"editor_{st.session_state.uploaded_workbook_hash[:12]}_{safe_id}"
+                        safe_id = hashlib.md5(f"{st.session_state.uploaded_workbook_hash}_{session_display}_{sheet_name}".encode("utf-8")).hexdigest()[:12]
+                        editor_key = f"editor_{safe_id}"
 
                         sg_total   = sum(st.session_state.edits.get(t["key"], {}).get("count", t["count"]) for t in group_tickets)
                         st.markdown(
@@ -1931,6 +1928,11 @@ elif st.session_state.page == "labels":
                                 "電話":   ed.get("tel", t.get("tel", "")),
                                 "座位":   seats_default,
                                 "張數":   int(ed.get("count", t["count"])),
+                                "修改":   "、".join(
+                                    f"{lbl} {old}→{ed[k]}" for k, lbl, old in
+                                    [("name", "姓名", t["name"]), ("count", "張數", t["count"]),
+                                     ("tel", "電話", t.get("tel", "")), ("seats", "座位", "、".join(t.get("seats", [])))]
+                                    if k in ed and str(ed[k]) != str(old)),
                             })
                         base_df = pd.DataFrame(rows)
 
@@ -1942,6 +1944,7 @@ elif st.session_state.page == "labels":
                                 "電話":   st.column_config.TextColumn("電話", width="medium"),
                                 "座位":   st.column_config.TextColumn("座位", width="large"),
                                 "張數":   st.column_config.NumberColumn("張數", width="small", min_value=1, max_value=300),
+                                "修改":   st.column_config.TextColumn("⚠ 與原檔差異", width="medium", disabled=True),
                             },
                             hide_index=True,
                             use_container_width=True,

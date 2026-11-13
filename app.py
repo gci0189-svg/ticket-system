@@ -1906,7 +1906,10 @@ elif st.session_state.page == "labels":
                     for sheet_name, group_tickets in sheet_groups.items():
                         import hashlib
                         safe_id = hashlib.md5(f"{session_display}_{sheet_name}".encode("utf-8")).hexdigest()[:12]
-                        editor_key = f"editor_{safe_id}"
+                        # Include the workbook hash so Streamlit cannot reuse an
+                        # old data_editor state when a new workbook has the same
+                        # sheet/session names.
+                        editor_key = f"editor_{st.session_state.uploaded_workbook_hash[:12]}_{safe_id}"
 
                         sg_total   = sum(st.session_state.edits.get(t["key"], {}).get("count", t["count"]) for t in group_tickets)
                         st.markdown(

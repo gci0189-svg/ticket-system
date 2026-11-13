@@ -750,6 +750,7 @@ def parse_member_sheet(df: pd.DataFrame, sheet_name: str, note_policy=None):
     excluded_notes = defaultdict(int)
     unresolved_notes = defaultdict(int)
     last_id  = None  # 追蹤最近一個有效編號
+    skipped_ids = {}  # 編號 → (dict, reason)：被備註排除／待確認的訂單，其無編號續行要跟著排除
 
     for i, row in enumerate(rows):
         if i < 2:
@@ -791,6 +792,9 @@ def parse_member_sheet(df: pd.DataFrame, sheet_name: str, note_policy=None):
         id_digits = re.sub(r'[^0-9]', '', row_id)
         if id_digits:
             last_id = id_digits
+        elif last_id in skipped_ids:
+            skipped_ids[last_id][0][skipped_ids[last_id][1]] += 1
+            continue
         
         if not last_id:
             warnings.append(f"第 {i+1} 行：找不到編號，已略過")
@@ -815,9 +819,11 @@ def parse_member_sheet(df: pd.DataFrame, sheet_name: str, note_policy=None):
                 note_action, note_reason = note_decision(row, note_policy)
                 if note_action == "排除":
                     excluded_notes[note_reason] += 1
+                    skipped_ids[last_id] = (excluded_notes, note_reason)
                     continue
                 if note_action == "待確認":
                     unresolved_notes[note_reason] += 1
+                    skipped_ids[last_id] = (unresolved_notes, note_reason)
                     continue
 
         if key not in merged:
@@ -1241,6 +1247,7 @@ def parse_custom_sheet(df, sheet_name, rule):
 
     key_occurrences = defaultdict(int)
     last_complete_context = None
+    last_skipped = None  # (dict, reason)：最近一筆被備註排除／待確認的訂單，其續行必須跟著排除
     incomplete_rows = []
     for row_idx in range(rule["data_start"], len(df)):
         row = df.iloc[row_idx]
@@ -1263,6 +1270,9 @@ def parse_custom_sheet(df, sheet_name, rule):
             known_no_print = no_print_note_reason(row_values)
             if known_no_print:
                 excluded_notes[known_no_print] += 1
+                if row_id and name and session:
+                    last_complete_context = (row_id, name, session)
+                    last_skipped = (excluded_notes, known_no_print)
                 continue
         elif note:
             # A 欄只有一般備註、同列沒有購票資料時，不視為待解析的訂單。
@@ -1276,6 +1286,9 @@ def parse_custom_sheet(df, sheet_name, rule):
         if (rule.get("merge_id") and last_complete_context and continuation_marker and count_raw
                 and not row_id and not name and not session):
             row_id, name, session = last_complete_context
+            if last_skipped:
+                last_skipped[0][last_skipped[1]] += 1
+                continue
 
         if not name or not session or not count_raw or (rule.get("member_format") and not row_id):
             if name or session or count_raw or row_id or seat or note:
@@ -1297,6 +1310,7 @@ def parse_custom_sheet(df, sheet_name, rule):
         label_session = format_member_label_session(session, sort_key) if rule.get("member_format") else display
         if row_id and name and session:
             last_complete_context = (row_id, name, session)
+            last_skipped = None
         if session_time_missing(session, display):
             warnings.append(f"第 {row_idx + 1} 行：無法辨識場次「{session}」，請在預覽中確認。")
         # A 欄備註只有在四個核對欄位都有效時才套用；缺少編號的備註列先阻擋，避免誤排除或漏印。
@@ -1312,9 +1326,11 @@ def parse_custom_sheet(df, sheet_name, rule):
                 note_action, note_reason = note_decision(row_values, rule.get("note_policy"))
                 if note_action == "排除":
                     excluded_notes[note_reason] += 1
+                    last_skipped = (excluded_notes, note_reason)
                     continue
                 if note_action == "待確認":
                     unresolved_notes[note_reason] += 1
+                    last_skipped = (unresolved_notes, note_reason)
                     continue
         change_note = any(marker in get_note_text(row_values) for marker in PRINT_CHANGE_NOTE_MARKERS)
         if rule.get("merge_id") and row_id:

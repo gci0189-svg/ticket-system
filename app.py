@@ -220,166 +220,152 @@ def apply_edits_to_xlsx(file_bytes: bytes, sheet_name: str, edits: dict, all_tic
     buf.seek(0)
     return buf.getvalue()
 
-def generate_signin_excel(file_bytes: bytes, sheet_name: str, show_name: str) -> bytes:
-    """
-    從報名表 xlsx 產生簽到表 Excel。
-    目前支援 LINE 會員格式（5月親子｜會員購票）。
-    回傳 Excel bytes。
-    """
-    wb_src = load_workbook(BytesIO(file_bytes), read_only=True)
-    ws_src = wb_src[sheet_name]
-    rows = list(ws_src.iter_rows(values_only=True))
+def _signin_seat_rows(t, ed):
+    """簽到表座位列：預設沿用解析結果（一筆訂單一列）；若在標籤頁手動改過座位，則以修改後為準。"""
+    s = ed.get("seats")
+    if s is None:
+        return [str(x).strip() for x in t.get("seats", []) if str(x).strip()]
+    s = str(s).strip()
+    return [s] if s else []
 
-    COL_ID=1; COL_SNS=2; COL_NAME=3; COL_TEL=4
-    COL_DATE=6; COL_SEAT=7; COL_COUNT=8; COL_PRICE=9
 
-    merged = {}
-    last_id = None
-    for i, row in enumerate(rows):
-        if i < 2: continue
-        if not _has_value(row, COL_SEAT): continue
-        if not _has_value(row, COL_COUNT): continue
-        if not _has_value(row, COL_PRICE): continue
+def _count_seats_in_line(line):
+    """數一行座位文字的座位數；格式無法確定（不是恰好一個「排」）回傳 None。"""
+    if line.count("排") != 1:
+        return None
+    tail = line.split("排", 1)[1]
+    tokens = [x for x in re.split(r"[、,，/／\s　]+", tail) if re.search(r"\d", x)]
+    return len(tokens) if tokens else None
 
-        count_raw = _get(row, COL_COUNT)
-        count_clean = re.sub(r"[^0-9]", "", count_raw)
-        if not count_clean: continue
-        count = int(count_clean)
-        if count <= 0: continue
 
-        row_id = _get(row, COL_ID)
-        id_digits = re.sub(r"[^0-9]", "", row_id)
-        if id_digits: last_id = id_digits
-        if not last_id: continue
+def signin_check(count, seat_rows):
+    """回傳可疑原因清單（只提醒，不修改資料）。座位數是由文字推算，僅供核對。"""
+    msgs = []
+    if count <= 0:
+        msgs.append("張數為 0")
+    if not seat_rows:
+        msgs.append("缺少座位")
+    else:
+        parts = []
+        for row in seat_rows:
+            for line in re.split(r"[\n\r]+", row):
+                if line.strip():
+                    parts.append(_count_seats_in_line(line))
+        if parts and all(p is not None for p in parts) and sum(parts) != count:
+            msgs.append(f"座位數 {sum(parts)} ≠ 張數 {count}")
+    return msgs
 
-        name = _get(row, COL_NAME)
-        sns  = _get(row, COL_SNS)
-        tel  = _get(row, COL_TEL)
-        date_raw = _get(row, COL_DATE)
 
-        if last_id not in merged:
-            m = re.search(r"\d{4}[/\-](\d{1,2})[/\-](\d{1,2})", date_raw)
-            month = int(m.group(1)) if m else 99
-            day   = int(m.group(2)) if m else 99
-            sess_ord = 1 if any(x in date_raw for x in ["14:30","下午"]) else 0
-            sess_str = "下午" if sess_ord else "上午"
-            wday_m = re.search(r"[(（](.)[ )）]", date_raw)
-            wday = wday_m.group(1) if wday_m else ""
-            time_str = "14:30" if sess_ord else "10:30"
-            full_date = f"2026/{month:02d}/{day:02d}（{wday}）{time_str}"
-            merged[last_id] = {
-                "id": last_id, "name": name, "sns": sns, "tel": tel,
-                "seats": [], "total": 0,
-                "sort": (month, day, sess_ord),
-                "session": f"{month}/{day} {sess_str}",
-                "full_date": full_date
-            }
-        else:
-            if not merged[last_id]["name"] and name: merged[last_id]["name"] = name
-            if not merged[last_id]["sns"] and sns:   merged[last_id]["sns"] = sns
-            if not merged[last_id]["tel"] and tel:   merged[last_id]["tel"] = tel
+def build_signin_data(tickets, edits):
+    """由標籤產生的結果整理簽到表資料，依場次分組、組內依編號排序。"""
+    ordered = sorted(tickets, key=lambda x: (x["earliest_sort"], ticket_id_sort(x)))
+    sessions = {}
+    for t in ordered:
+        ed = edits.get(t["key"], {})
+        seats = _signin_seat_rows(t, ed)
+        count = int(ed.get("count", t["count"]))
+        sessions.setdefault(t["earliest_display"], {"sort": t["earliest_sort"], "people": []})["people"].append({
+            "id": t["id"], "sns": t.get("sns", ""),
+            "name": ed.get("name", t["name"]), "tel": ed.get("tel", t.get("tel", "")),
+            "seats": seats, "count": count, "warn": signin_check(count, seats),
+        })
+    return sessions
 
-        seat = _get(row, COL_SEAT)
-        if seat:
-            for s in re.split(r"[\n\r]+", seat):
-                s = s.strip()
-                if s: merged[last_id]["seats"].append(s)
-        merged[last_id]["total"] += count
 
-    sorted_data = sorted(merged.values(), key=lambda x: (x["sort"], ticket_id_sort(x)))
-    sessions = defaultdict(list)
-    for r in sorted_data:
-        sessions[r["session"]].append(r)
+def _signin_title_date(display, sort_key, year):
+    month, day = sort_key[0], sort_key[1]
+    tm = re.search(r"\d{1,2}:\d{2}", display)
+    tail = tm.group(0) if tm else (display.split()[-1] if " " in display else "")
+    try:
+        wd = "一二三四五六日"[datetime(year, month, day).weekday()]
+    except ValueError:
+        return display
+    return f"{year}/{month:02d}/{day:02d}（{wd}）{tail}".strip()
 
-    # 樣式
+
+def generate_signin_excel(tickets, edits, show_name, year):
+    """由已解析的標籤資料產生簽到表（每場次一張工作表）。格式比照範本：
+    一筆訂單一列；編號／社群帳號／姓名／電話／張數／簽名欄於同一人多列時合併；張數顯示該人總數。"""
+    sessions = build_signin_data(tickets, edits)
     HDR_FONT = Font(name="Arial", bold=True, size=11)
     SUB_FILL = PatternFill("solid", start_color="E94560")
     SUB_FONT = Font(name="Arial", bold=True, color="FFFFFF", size=10)
     BODY_FONT = Font(name="Arial", size=10)
     BOLD_FONT = Font(name="Arial", bold=True, size=10)
-    ALT_FILL  = PatternFill("solid", start_color="FFF5F7")
-    TOT_FILL  = PatternFill("solid", start_color="EEEEEE")
+    ALT_FILL = PatternFill("solid", start_color="FFF5F7")
+    TOT_FILL = PatternFill("solid", start_color="EEEEEE")
     CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    LEFT   = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+    LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    aligns = [CENTER, LEFT, CENTER, CENTER, LEFT, CENTER, CENTER]
 
     wb_out = Workbook()
     wb_out.remove(wb_out.active)
+    used_names = set()
+    for display, info in sorted(sessions.items(), key=lambda kv: kv[1]["sort"]):
+        people = info["people"]
+        name = format_member_label_session(display, info["sort"]).replace("/", "-") or re.sub(r"[\\/*?:\[\]]", "-", display)
+        if name in used_names or not name:
+            name = re.sub(r"[\\/*?:\[\]]", "-", display) or "場次"
+        used_names.add(name)
+        ws = wb_out.create_sheet(title=name[:31])
 
-    for session_display, sess_rows in sessions.items():
-        safe_name = session_display.replace("/", "-")
-        ws = wb_out.create_sheet(title=safe_name)
-        first = sess_rows[0]
-
-        # Row1：A1=日期，C1=劇名（比照舊版）
-        ws.row_dimensions[1].height = 22
-        ws["A1"] = first["full_date"]
+        ws.row_dimensions[1].height = 25
+        ws["A1"] = _signin_title_date(display, info["sort"], year)
         ws["A1"].font = HDR_FONT
         ws["A1"].alignment = Alignment(horizontal="left", vertical="center")
         ws["C1"] = show_name
         ws["C1"].font = HDR_FONT
         ws["C1"].alignment = Alignment(horizontal="left", vertical="center")
-
-        # Row2：欄位標題
-        ws.row_dimensions[2].height = 20
-        col_headers = ["編號", "社群帳號", "姓名", "電話", "座位", "張數", "領取簽名"]
-        for col, h in enumerate(col_headers, 1):
+        ws.row_dimensions[2].height = 25
+        for col, h in enumerate(["編號", "社群帳號", "姓名", "電話", "座位", "張數", "領取簽名"], 1):
             c = ws.cell(row=2, column=col, value=h)
-            c.font = SUB_FONT; c.fill = SUB_FILL
-            c.alignment = CENTER; c.border = _thin_border()
+            c.font = SUB_FONT; c.fill = SUB_FILL; c.alignment = CENTER; c.border = _thin_border()
 
-        # 資料列
-        for idx, r in enumerate(sess_rows):
-            row_num = idx + 3
+        seat_w = min(max(max((_cjk_len(s) for p in people for s in p["seats"]), default=10) + 2, 20), 45)
+        row_num = 3
+        for idx, p in enumerate(people):
+            seat_rows = p["seats"] or [""]
+            start = row_num
             fill = ALT_FILL if idx % 2 == 1 else None
-            seat_str = "　".join(r["seats"])
-            values = [r["id"], r["sns"], r["name"], r["tel"], seat_str, r["total"], ""]
-            aligns = [CENTER, LEFT, CENTER, CENTER, LEFT, CENTER, CENTER]
-            for col, (val, aln) in enumerate(zip(values, aligns), 1):
-                c = ws.cell(row=row_num, column=col, value=val)
-                c.font = BODY_FONT; c.alignment = aln; c.border = _thin_border()
-                if fill: c.fill = fill
+            for i, seat in enumerate(seat_rows):
+                first = (i == 0)
+                values = [p["id"] if first else None, p["sns"] if first else None,
+                          p["name"] if first else None, p["tel"] if first else None,
+                          seat, p["count"] if first else None, None]
+                for col, (val, aln) in enumerate(zip(values, aligns), 1):
+                    c = ws.cell(row=row_num, column=col, value=val)
+                    c.font = BODY_FONT; c.alignment = aln; c.border = _thin_border()
+                    if fill: c.fill = fill
+                lines = sum(max(1, int(_cjk_len(l) / seat_w) + 1) for l in re.split(r"[\n\r]+", seat) if l.strip()) or 1
+                ws.row_dimensions[row_num].height = max(24, lines * 16)
+                row_num += 1
+            if len(seat_rows) > 1:
+                for col in (1, 2, 3, 4, 6, 7):
+                    ws.merge_cells(start_row=start, start_column=col, end_row=row_num - 1, end_column=col)
 
-        # 合計列
-        total_row = len(sess_rows) + 3
-        ws.merge_cells(f"A{total_row}:E{total_row}")
-        c = ws.cell(row=total_row, column=1, value=f"合計：{len(sess_rows)} 人")
-        c.font = BOLD_FONT; c.alignment = CENTER; c.fill = TOT_FILL; c.border = _thin_border()
-        tc = ws.cell(row=total_row, column=6, value=f"=SUM(F3:F{total_row-1})")
-        tc.font = BOLD_FONT; tc.alignment = CENTER; tc.fill = TOT_FILL; tc.border = _thin_border()
-        ws.cell(row=total_row, column=7).fill = TOT_FILL
-        ws.cell(row=total_row, column=7).border = _thin_border()
+        ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=5)
+        c = ws.cell(row=row_num, column=1, value=f"合計：{len(people)} 人")
+        c.font = BOLD_FONT; c.alignment = CENTER
+        for col in range(1, 8):
+            cell = ws.cell(row=row_num, column=col)
+            cell.fill = TOT_FILL; cell.border = _thin_border()
+        tc = ws.cell(row=row_num, column=6, value=sum(p["count"] for p in people))
+        tc.font = BOLD_FONT; tc.alignment = CENTER
+        ws.row_dimensions[row_num].height = 24
 
-        # 自動欄寬
-        col_data = {
-            1: [r["id"] for r in sess_rows] + ["編號"],
-            2: [r["sns"] for r in sess_rows] + ["社群帳號"],
-            3: [r["name"] for r in sess_rows] + ["姓名"],
-            4: [r["tel"] for r in sess_rows] + ["電話"],
-            5: ["　".join(r["seats"]) for r in sess_rows] + ["座位"],
-            6: [r["total"] for r in sess_rows] + ["張數"],
-            7: ["領取簽名"],
-        }
-        min_ws_map = {1:6, 2:12, 3:8, 4:14, 5:20, 6:6, 7:12}
-        max_ws_map = {1:8, 2:25, 3:12, 4:16, 5:45, 6:8, 7:15}
-        for col_idx, values in col_data.items():
-            max_w = max((_cjk_len(v) for v in values if v), default=min_ws_map[col_idx])
-            w = min(max(max_w + 2, min_ws_map[col_idx]), max_ws_map[col_idx])
-            ws.column_dimensions[get_column_letter(col_idx)].width = w
-
-        # 自動列高
-        col5_w = ws.column_dimensions["E"].width
-        for idx, r in enumerate(sess_rows):
-            row_num = idx + 3
-            seat_str = "　".join(r["seats"])
-            lines = max(1, int(_cjk_len(seat_str) / max(col5_w, 1)) + 1)
-            ws.row_dimensions[row_num].height = max(18, lines * 16)
-
+        widths = {1: 8, 2: 25, 3: 14, 4: 16, 5: seat_w, 6: 8, 7: 15}
+        for col, w in widths.items():
+            ws.column_dimensions[get_column_letter(col)].width = w
+        for col, key in ((2, "sns"), (3, "name"), (4, "tel")):
+            mx = max((_cjk_len(p[key]) for p in people if p[key]), default=0)
+            ws.column_dimensions[get_column_letter(col)].width = min(max(mx + 2, widths[col] if col == 3 else 12), 28)
         ws.freeze_panes = "A3"
 
     buf = BytesIO()
     wb_out.save(buf)
     buf.seek(0)
     return buf.getvalue()
+
 
 def parse_session(raw: str):
     """解析日期場次字串，回傳 (排序key, 顯示文字)
@@ -2017,61 +2003,55 @@ elif st.session_state.page == "labels":
 # ══════════════════════════════════════════════════════════
 elif st.session_state.page == "signin":
 
-    if not st.session_state.rule_confirmed or not st.session_state.selected_sheets:
-        st.markdown('<div class="note-info">請先到「📤 上傳與處理」完成上傳與規則確認。</div>', unsafe_allow_html=True)
+    st.markdown('<div class="note-warn">⚠ 簽到表功能異常，待討論完一起修改。</div>', unsafe_allow_html=True)
+    if not st.session_state.rule_confirmed or not st.session_state.selected_sheets or not st.session_state.tickets:
+        st.markdown('<div class="note-info">請先到「📤 上傳與處理」完成上傳與規則確認，並完成標籤產生。</div>', unsafe_allow_html=True)
+    elif any(t.get("fmt") != "member" for t in st.session_state.tickets):
+        st.markdown('<div class="note-warn">目前簽到表只支援 LINE 會員格式的工作表；本次選取的工作表包含其他格式。</div>', unsafe_allow_html=True)
     else:
-        sname = st.session_state.selected_sheets[0]
-        row0_str = " ".join(str(c) for c in st.session_state.raw_sheets[sname].iloc[0].tolist())
-        is_member = ("姓名" in row0_str and "張數" in row0_str and "座位" in row0_str)
+        all_tickets = st.session_state.tickets
+        signin_data = build_signin_data(all_tickets, st.session_state.edits)
 
-        if not is_member:
-            st.markdown('<div class="note-warn">此工作表格式尚未支援產生簽到表，請聯絡管理員更新程式。</div>', unsafe_allow_html=True)
-        else:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown('<div class="card-title">簽到表設定 ＆ 下載</div>', unsafe_allow_html=True)
-            col_name, col_btn = st.columns([4, 1])
-            with col_name:
-                show_name_input = st.text_input(
-                    "演出名稱（顯示在簽到表標題）",
-                    value="親子音樂劇《阿甯咕的爸鼻不見了？》",
-                    key="show_name_input"
-                )
-            with col_btn:
-                st.markdown("<br>", unsafe_allow_html=True)
-                if st.session_state.get("uploaded_file_bytes"):
-                    excel_bytes = generate_signin_excel(st.session_state.uploaded_file_bytes, sname, show_name_input)
-                    st.download_button(
-                        "📥 下載 Excel", data=excel_bytes,
-                        file_name=f"簽到表_{sname}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True, type="primary"
-                    )
-                else:
-                    st.warning("請重新上傳 xlsx")
-            st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown('<div class="card-title">簽到表設定 ＆ 下載</div>', unsafe_allow_html=True)
+        col_name, col_year, col_btn = st.columns([4, 1, 1])
+        with col_name:
+            show_name_input = st.text_input("演出名稱（顯示在簽到表標題）",
+                                            value="親子音樂劇《阿甯咕的爸鼻不見了？》", key="show_name_input")
+        with col_year:
+            year_input = st.number_input("年份（用來算星期）", min_value=2000, max_value=2100,
+                                         value=datetime.now().year, step=1, key="signin_year")
+        with col_btn:
+            st.markdown("<br>", unsafe_allow_html=True)
+            excel_bytes = generate_signin_excel(all_tickets, st.session_state.edits, show_name_input, int(year_input))
+            st.download_button(
+                "📥 下載 Excel", data=excel_bytes,
+                file_name=f"簽到表_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True, type="primary")
+        st.markdown('</div>', unsafe_allow_html=True)
 
-            all_tickets = st.session_state.tickets
-            if all_tickets:
-                preview_sessions = defaultdict(list)
-                for t in sorted(all_tickets, key=lambda x: (x["earliest_sort"], ticket_id_sort(x))):
-                    preview_sessions[t["earliest_display"]].append(t)
+        warn_lines = [f"{sd}　編號 {p['id']} {p['name']}：{'、'.join(p['warn'])}"
+                      for sd, info in signin_data.items() for p in info["people"] if p["warn"]]
+        if warn_lines:
+            st.markdown('<div class="note-warn">⚠ 有 %d 筆資料需要人工核對（只提醒，不會修改資料；座位數由文字推算，僅供參考；下載的 Excel 不含此標示）：<br>%s</div>'
+                        % (len(warn_lines), "<br>".join(warn_lines)), unsafe_allow_html=True)
 
-                st.markdown('<div class="card">', unsafe_allow_html=True)
-                st.markdown('<div class="card-title">👁 簽到表預覽</div>', unsafe_allow_html=True)
-                session_names = sorted(preview_sessions.keys(), key=lambda s: preview_sessions[s][0]["earliest_sort"])
-                tabs = st.tabs([f"🗓 {s}" for s in session_names])
-                for tab, session_display in zip(tabs, session_names):
-                    with tab:
-                        sess_tickets = preview_sessions[session_display]
-                        sess_total = sum(t["count"] for t in sess_tickets)
-                        st.caption(f"{len(sess_tickets)} 人 ／ {sess_total} 張")
-                        preview_data = [{
-                            "編號": t["id"], "社群帳號": t.get("sns",""), "姓名": t["name"],
-                            "電話": t.get("tel",""), "座位": "　".join(t.get("seats",[])),
-                            "張數": t["count"], "領取簽名": ""
-                        } for t in sess_tickets]
-                        st.dataframe(pd.DataFrame(preview_data), use_container_width=True, hide_index=True,
-                                     height=min(500, max(150, len(sess_tickets) * 36 + 40)))
-                st.markdown('</div>', unsafe_allow_html=True)
-            else:
-                st.markdown('<div class="note-info">請先完成標籤產生，才能預覽簽到表。</div>', unsafe_allow_html=True)
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown('<div class="card-title">👁 簽到表預覽</div>', unsafe_allow_html=True)
+        session_names = sorted(signin_data.keys(), key=lambda s: signin_data[s]["sort"])
+        tabs = st.tabs([f"🗓 {s}" for s in session_names])
+        for tab, sd in zip(tabs, session_names):
+            with tab:
+                people = signin_data[sd]["people"]
+                st.caption(f"合計：{len(people)} 人 ／ {sum(p['count'] for p in people)} 張")
+                preview_df = pd.DataFrame([{
+                    "編號": p["id"], "社群帳號": p["sns"], "姓名": p["name"], "電話": p["tel"],
+                    "座位": "　｜　".join(s.replace("\n", " ") for s in p["seats"]),
+                    "張數": p["count"], "⚠ 提醒": "、".join(p["warn"]),
+                } for p in people])
+                styled = preview_df.style.apply(
+                    lambda r: ["background-color: #FFF3C4" if r["⚠ 提醒"] else "" for _ in r], axis=1)
+                st.dataframe(styled, use_container_width=True, hide_index=True,
+                             height=min(500, max(150, len(people) * 36 + 40)))
+        st.markdown('</div>', unsafe_allow_html=True)

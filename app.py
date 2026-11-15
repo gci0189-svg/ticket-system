@@ -481,36 +481,74 @@ def required_fields_valid_for_note(row, columns, carried_id=""):
     _, display = parse_session(session)
     return bool(row_id and name and session and has_count and not session_time_missing(session, display))
 
+# ── A 欄備註分類（內建詞庫）────────────────────────────────
+# 類別：不印／異動／提醒／忽略／無法辨識。除「不印」外一律照常列印；備註不會修改票數與場次。
+NOTE_HESITATE_PREFIX = r"(?:未|尚未|還未|沒|還沒|沒有|非|待|考慮|想|欲|可能|預計)$"
+NOTE_EXCLUDE_MARKERS = (
+    "退票", "取消", "已拿票", "已取票", "票已取", "已領取", "已領票", "領取完", "已拿走", "已取走", "拿走了",
+    "郵遞", "郵寄", "寄出", "已寄", "已印票", "已完成寄送",
+)
+NOTE_IGNORE_PATTERN = r"開賣"
+NOTE_CHANGE_PATTERN = (
+    r"換|追加|[加追]\s*[一二三四五六七八九十\d]+\s*張|加票|減票|少\s*[一二三四五六七八九十\d]+\s*張|"
+    r"退\s*[一二三四五六七八九十\d]+\s*張|改.{0,3}[折票]|升等|降等"
+)
+NOTE_REMIND_PATTERN = (
+    r"收據|小方巾|益生菌|蠟筆|退錢|退款|退差額|退費|找零|現場給|買包|未印票|考慮退票|禮物|商品"
+)
+
+
+def _note_marker_active(note, marker):
+    """備註中的關鍵字是否真的成立（排除「未／尚未／待／考慮…」這類否定或猶豫前綴）。"""
+    start = 0
+    while True:
+        pos = note.find(marker, start)
+        if pos < 0:
+            return False
+        if not re.search(NOTE_HESITATE_PREFIX, note[max(0, pos - 3):pos]):
+            return True
+        start = pos + 1
+
+
+def classify_note(note):
+    """回傳 (類別, 原因)。類別：不印／異動／提醒／忽略／無法辨識。"""
+    note = re.sub(r"\s+", " ", str(note or "")).strip()
+    if not note:
+        return "", ""
+    if "待選位" in note:
+        return "不印", "待選位"
+    for marker in NOTE_EXCLUDE_MARKERS:
+        if _note_marker_active(note, marker):
+            return "不印", marker
+    if re.search(NOTE_IGNORE_PATTERN, note):
+        return "忽略", ""
+    if re.search(NOTE_CHANGE_PATTERN, note):
+        return "異動", ""
+    if re.search(NOTE_REMIND_PATTERN, note):
+        return "提醒", ""
+    return "無法辨識", ""
+
+
 def no_print_note_reason(row):
     """Return a known no-print status found in column A, if any."""
-    note = get_note_text(row)
-    for marker in NO_PRINT_NOTE_MARKERS:
-        position = note.find(marker)
-        if position < 0:
-            continue
-        prefix = note[max(0, position - 2):position]
-        if re.search(r"(?:未|尚未|非|待)$", prefix):
-            continue
-        return marker
-    return ""
+    category, reason = classify_note(get_note_text(row))
+    return reason if category == "不印" else ""
+
 
 def note_decision(row, note_policy=None):
+    """只回傳「排除」或「繼續」。人工勾選（True＝列印）優先於自動判斷；無法辨識的備註預設列印。"""
     note = get_note_text(row)
     if not note:
         return "繼續", ""
-    if note_policy is not None and note in note_policy:
-        decision = note_policy[note]
-        if decision == "排除":
-            return "排除", no_print_note_reason(row) or note
-        if decision == "照常判斷":
+    if note_policy is not None and isinstance(note_policy.get(note), bool):
+        if note_policy[note]:
             return "繼續", ""
-        return "待確認", note
+        return "排除", no_print_note_reason(row) or note
     reason = no_print_note_reason(row)
     if reason:
         return "排除", reason
-    if any(marker in note for marker in PRINT_CHANGE_NOTE_MARKERS):
-        return "繼續", ""
-    return "待確認", note
+    return "繼續", ""
+
 
 def default_note_decision(note):
     """Known ticket changes remain printable; only explicit no-print states default to exclusion."""
@@ -576,31 +614,34 @@ def render_note_review(df, data_start, key, saved_policy=None, required_columns=
         return {}, 0
 
     st.markdown("**A 欄備註確認**")
-    st.caption("退票、取消、已拿票、郵遞／郵寄、已印票會預設排除；換位、換日期、加票、減票會照常列印。其他備註請人工選擇，備註不會自動更改場次或票數。")
-    rows = []
+    st.caption("系統已依備註內容自動判斷並預先勾選：☑ 列印＝產生標籤，☐ 不勾＝不產生。"
+               "⚠ 無法辨識的備註預設列印，請確認。備註只決定要不要印，不會更改場次或票數。")
     saved_policy = saved_policy or {}
+    rows = []
     for note, count in note_counts.items():
-        known_change = any(marker in note for marker in PRINT_CHANGE_NOTE_MARKERS)
-        default_decision = "照常判斷" if known_change else saved_policy.get(note)
-        if default_decision not in ("待確認", "照常判斷", "排除"):
-            default_decision = default_note_decision(note)
-        rows.append({"A 欄備註": note, "筆數": count, "處理方式": default_decision})
-    note_df = pd.DataFrame(rows)
+        category, _ = classify_note(note)
+        default_print = saved_policy.get(note) if isinstance(saved_policy.get(note), bool) else category != "不印"
+        rows.append({"列印": default_print,
+                     "判定": "⚠ 無法辨識" if category == "無法辨識" else category,
+                     "A 欄備註": note, "筆數": count})
+    rows.sort(key=lambda r: 0 if r["判定"].startswith("⚠") else 1)
+    unknown = [r for r in rows if r["判定"].startswith("⚠")]
+    if unknown:
+        st.warning(f"有 {len(unknown)} 種備註系統無法辨識（共 {sum(r['筆數'] for r in unknown)} 筆），已預設列印，請檢查是否需要取消勾選。")
     edited = st.data_editor(
-        note_df,
+        pd.DataFrame(rows),
         column_config={
+            "列印": st.column_config.CheckboxColumn("列印", width="small"),
+            "判定": st.column_config.TextColumn("判定", disabled=True, width="small"),
             "A 欄備註": st.column_config.TextColumn("A 欄備註", disabled=True),
             "筆數": st.column_config.NumberColumn("筆數", disabled=True, width="small"),
-            "處理方式": st.column_config.SelectboxColumn(
-                "處理方式", options=["待確認", "照常判斷", "排除"], required=True,
-            ),
         },
         hide_index=True, use_container_width=True,
-        key=f"note_review_v2_{key}_{data_start}",
+        key=f"note_review_v3_{key}_{data_start}",
     )
-    policy = {str(r["A 欄備註"]): str(r["處理方式"]) for _, r in edited.iterrows()}
-    unresolved = sum(int(r["筆數"]) for _, r in edited.iterrows() if r["處理方式"] == "待確認")
-    return policy, unresolved
+    policy = {str(r["A 欄備註"]): bool(r["列印"]) for _, r in edited.iterrows()}
+    return policy, 0
+
 
 def render_note_review_sheets(sheet_names, raw_sheets, data_start, key, required_columns, saved_policy=None, carry_id=False):
     combined_rows = []
@@ -828,6 +869,7 @@ def parse_member_sheet(df: pd.DataFrame, sheet_name: str, note_policy=None):
                 "earliest_sort":    sort_key,
                 "earliest_display": display,
                 "force_revision":   change_note,
+                "notes":            [],
             }
         else:
             # 更新最早場次
@@ -839,6 +881,10 @@ def parse_member_sheet(df: pd.DataFrame, sheet_name: str, note_policy=None):
                 merged[key]["name"] = name
             if change_note:
                 merged[key]["force_revision"] = True
+
+        _note_txt = re.sub(r"\s+", " ", get_note_text(row))
+        if _note_txt and _note_txt not in merged[key]["notes"]:
+            merged[key]["notes"].append(_note_txt)
 
         # 收集座位（同格內換行也分開）
         raw_seat = str(row[7]).strip() if len(row) > 7 and row[7] else ""
@@ -1000,6 +1046,7 @@ def parse_taibei_sheet(df: pd.DataFrame, sheet_name: str, note_policy=None):
                 "sheet": sheet_name, "total_count": 0,
                 "earliest_sort": earliest_sort, "earliest_display": earliest_display,
                 "force_revision": change_note,
+                "notes": [],
             }
         else:
             if earliest_sort < merged[key]["earliest_sort"]:
@@ -1012,6 +1059,9 @@ def parse_taibei_sheet(df: pd.DataFrame, sheet_name: str, note_policy=None):
             if change_note:
                 merged[key]["force_revision"] = True
 
+        _note_txt = re.sub(r"\s+", " ", get_note_text(row))
+        if _note_txt and _note_txt not in merged[key]["notes"]:
+            merged[key]["notes"].append(_note_txt)
         merged[key]["total_count"] += total
 
     append_rule_exclusion_summary(warnings_list, "現場取票欄", non_pickup_skipped)
@@ -1139,6 +1189,7 @@ def parse_other_sheet(df: pd.DataFrame, sheet_name: str, note_policy=None):
                 "sheet": sheet_name, "total_count": count, "count": count,
                 "earliest_sort": sort_key, "earliest_display": display,
                 "label": label, "fmt": "label",
+                "notes": [re.sub(r"\s+", " ", get_note_text(row))] if get_note_text(row) else [],
             }
             tickets.append(entry)
 
@@ -1253,7 +1304,8 @@ def parse_custom_sheet(df, sheet_name, rule):
         seat = value("座位")
         note = get_note_text(row_values)
         if note and has_data_outside_a(row_values):
-            known_no_print = no_print_note_reason(row_values)
+            _act, known_no_print = note_decision(row_values, rule.get("note_policy"))
+            known_no_print = known_no_print if _act == "排除" else ""
             if known_no_print:
                 excluded_notes[known_no_print] += 1
                 if row_id and name and session:
@@ -1347,6 +1399,9 @@ def parse_custom_sheet(df, sheet_name, rule):
                 merged[key]["fmt"] = "member"
             if seat and seat not in merged[key]["seats"]:
                 merged[key]["seats"].append(seat)
+            _note_txt = re.sub(r"\s+", " ", note)
+            if _note_txt and _note_txt not in merged[key].setdefault("notes", []):
+                merged[key]["notes"].append(_note_txt)
             if change_note:
                 merged[key]["force_revision"] = True
             continue
@@ -1365,6 +1420,7 @@ def parse_custom_sheet(df, sheet_name, rule):
             "organization": organization,
             "sns": "", "tel": value("電話"), "seats": [seat] if seat else [],
             "force_revision": change_note,
+            "notes": [re.sub(r"\s+", " ", note)] if note else [],
             "fmt": "member" if rule.get("member_format") else "custom",
         }
         merged[key] = entry
@@ -1930,6 +1986,7 @@ elif st.session_state.page == "labels":
                                 "電話":   ed.get("tel", t.get("tel", "")),
                                 "座位":   seats_default,
                                 "張數":   int(ed.get("count", t["count"])),
+                                "備註":   "；".join(t.get("notes", [])),
                                 "修改":   "、".join(
                                     f"{lbl} {old}→{ed[k]}" for k, lbl, old in
                                     [("name", "姓名", t["name"]), ("count", "張數", t["count"]),
@@ -1946,6 +2003,7 @@ elif st.session_state.page == "labels":
                                 "電話":   st.column_config.TextColumn("電話", width="medium"),
                                 "座位":   st.column_config.TextColumn("座位", width="large"),
                                 "張數":   st.column_config.NumberColumn("張數", width="small", min_value=1, max_value=300),
+                                "備註":   st.column_config.TextColumn("備註（A 欄）", width="medium", disabled=True),
                                 "修改":   st.column_config.TextColumn("⚠ 與原檔差異", width="medium", disabled=True),
                             },
                             hide_index=True,
